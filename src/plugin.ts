@@ -1552,6 +1552,261 @@ const saidPlugin: Plugin = {
   actions: [performSaidAuditAction, listAgentsAction, watcherStatusAction, reauditNowAction, driftReportAction],
   providers: [saidTrustProvider],
   evaluators: [auditOpportunityEvaluator],
+  routes: [
+    // ── JSON API ──────────────────────────────────────────────────────────────
+    {
+      type: 'GET' as const,
+      path: '/api/sentinel/dashboard',
+      public: true,
+      handler: async (
+        _req: { params?: Record<string, string> },
+        res: {
+          json: (data: unknown) => void;
+          status: (code: number) => { json: (data: unknown) => void };
+        },
+        runtime: IAgentRuntime
+      ): Promise<void> => {
+        const svc = runtime.getService<SaidSentinelService>(
+          SaidSentinelService.serviceType as Parameters<typeof runtime.getService>[0]
+        );
+        if (!svc) {
+          res.status(503).json({ error: 'Service not ready' });
+          return;
+        }
+
+        let registryTotal = 0;
+        let registryVerified = 0;
+        try {
+          const stats = await svc.saidClient.getStats();
+          registryTotal = stats.total;
+          registryVerified = stats.verified;
+        } catch { /* non-fatal — use zeros */ }
+
+        const leaderboard = Array.from(svc.driftHistory.entries())
+          .filter(([, records]) => records.length > 0)
+          .map(([wallet, records]) => {
+            const a = computeDriftAnalysis(wallet, records);
+            return {
+              wallet,
+              severity: a.severity,
+              scoreDrop: Math.round(a.scoreDrop * 100),
+              latestVerdict: a.latestVerdict,
+              recordCount: a.recordCount,
+            };
+          })
+          .sort(
+            (a, b) =>
+              severityRank(b.severity) - severityRank(a.severity) || b.scoreDrop - a.scoreDrop
+          )
+          .slice(0, 20);
+
+        const bySeverity = { NONE: 0, MILD: 0, MODERATE: 0, SEVERE: 0 };
+        for (const e of leaderboard) bySeverity[e.severity]++;
+
+        res.json({
+          timestamp: new Date().toISOString(),
+          registry: {
+            total: registryTotal,
+            verified: registryVerified,
+            watcherTracking: svc.knownAgentWallets.size,
+          },
+          watcher: {
+            running: svc.watcherTimer !== null,
+            startedAt: svc.watcherStartedAt?.toISOString() ?? null,
+            pollIntervalMs: WATCHER_POLL_MS,
+          },
+          reauditor: {
+            running: svc.reauditorTimer !== null,
+            cycleInProgress: svc.reauditorRunning,
+            lastRun: svc.reauditorLastRun?.toISOString() ?? null,
+            nextRun: svc.reauditorNextRun?.toISOString() ?? null,
+            lastCycleStats: svc.reauditorLastCycleStats,
+            coverage: {
+              audited: svc.auditHistory.size,
+              total: svc.knownAgentWallets.size,
+            },
+          },
+          drift: { leaderboard, bySeverity },
+          digest: { lastSent: svc.digestLastSent?.toISOString() ?? null },
+        });
+      },
+    },
+
+    // ── Dashboard HTML ────────────────────────────────────────────────────────
+    {
+      type: 'GET' as const,
+      path: '/dashboard',
+      public: true,
+      handler: async (
+        _req: unknown,
+        res: {
+          setHeader?: (name: string, value: string) => void;
+          send: (body: unknown) => void;
+        }
+      ): Promise<void> => {
+        res.setHeader?.('Content-Type', 'text/html; charset=utf-8');
+        res.send(DASHBOARD_HTML);
+      },
+    },
+  ],
 };
 
 export default saidPlugin;
+
+// ─── Dashboard HTML ────────────────────────────────────────────────────────────
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Said Sentinel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>body{font-family:monospace}</style>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen p-6">
+  <div class="max-w-4xl mx-auto space-y-8">
+
+    <div class="flex items-start justify-between">
+      <div>
+        <h1 class="text-xl font-bold tracking-tight text-white">🛡 Said Sentinel</h1>
+        <p class="text-xs text-zinc-500 mt-1">Autonomous Trust Audit · Said Protocol</p>
+      </div>
+      <div class="text-right text-xs text-zinc-500">
+        <div id="status-line">connecting…</div>
+        <div id="next-refresh" class="text-zinc-600 mt-0.5"></div>
+      </div>
+    </div>
+
+    <div>
+      <p class="text-xs text-zinc-500 uppercase tracking-widest mb-3">Registry</p>
+      <div class="grid grid-cols-3 gap-3">
+        <div class="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div id="reg-total" class="text-3xl font-bold text-white">—</div>
+          <div class="text-xs text-zinc-500 mt-1">Total Agents</div>
+        </div>
+        <div class="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div id="reg-verified" class="text-3xl font-bold text-emerald-400">—</div>
+          <div class="text-xs text-zinc-500 mt-1">Verified</div>
+        </div>
+        <div class="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div id="reg-tracked" class="text-3xl font-bold text-sky-400">—</div>
+          <div class="text-xs text-zinc-500 mt-1">Watcher Tracking</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <p class="text-xs text-zinc-500 uppercase tracking-widest mb-3">Services</p>
+      <div class="grid grid-cols-2 gap-3">
+        <div class="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div class="flex items-center gap-2 mb-3">
+            <span id="watcher-dot" class="w-2 h-2 rounded-full bg-zinc-600"></span>
+            <span class="text-sm font-semibold">New Agent Watcher</span>
+          </div>
+          <div id="watcher-details" class="text-xs text-zinc-500 space-y-1"></div>
+        </div>
+        <div class="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div class="flex items-center gap-2 mb-3">
+            <span id="reauditor-dot" class="w-2 h-2 rounded-full bg-zinc-600"></span>
+            <span class="text-sm font-semibold">Continuous Re-Auditor</span>
+          </div>
+          <div id="reauditor-details" class="text-xs text-zinc-500 space-y-1"></div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <p class="text-xs text-zinc-500 uppercase tracking-widest mb-3">Reputation Drift Leaderboard</p>
+      <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="border-b border-zinc-800">
+            <tr>
+              <th class="text-left px-4 py-3 text-xs text-zinc-500 font-normal">Agent</th>
+              <th class="text-left px-4 py-3 text-xs text-zinc-500 font-normal">Severity</th>
+              <th class="text-left px-4 py-3 text-xs text-zinc-500 font-normal">Score Drop</th>
+              <th class="text-left px-4 py-3 text-xs text-zinc-500 font-normal">Audits</th>
+              <th class="text-left px-4 py-3 text-xs text-zinc-500 font-normal">Latest</th>
+            </tr>
+          </thead>
+          <tbody id="leaderboard-body">
+            <tr><td colspan="5" class="px-4 py-8 text-center text-zinc-600 text-xs">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="text-xs text-zinc-600 text-center pb-4">
+      Auto-refreshes every 30s ·
+      <a href="https://t.me/SaidSentinelAlerts" class="text-zinc-400 hover:text-white transition-colors">@SaidSentinelAlerts</a>
+    </div>
+
+  </div>
+<script>
+const SC = {NONE:'text-emerald-400',MILD:'text-yellow-400',MODERATE:'text-orange-400',SEVERE:'text-red-400'};
+const SI = {NONE:'✅',MILD:'🟡',MODERATE:'🟠',SEVERE:'🔴'};
+const VC = {PASS:'text-emerald-400',WARNING:'text-yellow-400',FAIL:'text-red-400',ERROR:'text-zinc-400'};
+
+function ago(iso){
+  if(!iso)return'N/A';
+  const s=(Date.now()-new Date(iso).getTime())/1000;
+  if(s<60)return'just now';
+  if(s<3600)return Math.floor(s/60)+'m ago';
+  if(s<86400)return Math.floor(s/3600)+'h ago';
+  return new Date(iso).toLocaleDateString();
+}
+function lines(arr){return arr.filter(Boolean).map(l=>'<div>'+l+'</div>').join('');}
+
+async function refresh(){
+  try{
+    const d=await fetch('/api/sentinel/dashboard').then(r=>r.json());
+    document.getElementById('status-line').textContent='updated '+ago(d.timestamp);
+    document.getElementById('reg-total').textContent=d.registry.total;
+    document.getElementById('reg-verified').textContent=d.registry.verified;
+    document.getElementById('reg-tracked').textContent=d.registry.watcherTracking;
+
+    document.getElementById('watcher-dot').className='w-2 h-2 rounded-full '+(d.watcher.running?'bg-emerald-500':'bg-red-500');
+    document.getElementById('watcher-details').innerHTML=lines([
+      d.watcher.running?'<span class="text-emerald-400">Running</span>':'<span class="text-red-400">Stopped</span>',
+      'Started: '+ago(d.watcher.startedAt),
+      'Poll every '+Math.round(d.watcher.pollIntervalMs/60000)+'min',
+    ]);
+
+    const cov=d.reauditor.coverage;
+    const pct=cov.total>0?Math.round(cov.audited/cov.total*100):0;
+    document.getElementById('reauditor-dot').className='w-2 h-2 rounded-full '+(d.reauditor.running?'bg-emerald-500':'bg-red-500');
+    document.getElementById('reauditor-details').innerHTML=lines([
+      d.reauditor.running
+        ?'<span class="text-emerald-400">Scheduled</span>'+(d.reauditor.cycleInProgress?' <span class="text-yellow-400">(running)</span>':'')
+        :'<span class="text-red-400">Stopped</span>',
+      'Last run: '+ago(d.reauditor.lastRun),
+      'Next run: '+ago(d.reauditor.nextRun),
+      d.reauditor.lastCycleStats?'Last cycle: '+d.reauditor.lastCycleStats.audited+' audited, '+d.reauditor.lastCycleStats.alerts+' alerts':null,
+      'Coverage: '+cov.audited+'/'+cov.total+' ('+pct+'%)',
+    ]);
+
+    const tbody=document.getElementById('leaderboard-body');
+    const lb=d.drift.leaderboard;
+    tbody.innerHTML=lb.length===0
+      ?'<tr><td colspan="5" class="px-4 py-8 text-center text-zinc-600 text-xs">No drift data yet</td></tr>'
+      :lb.map(r=>\`<tr class="border-t border-zinc-800/50 hover:bg-zinc-800/30">
+        <td class="px-4 py-3 text-xs text-zinc-300">\${r.wallet.slice(0,8)}…\${r.wallet.slice(-4)}</td>
+        <td class="px-4 py-3 text-xs \${SC[r.severity]||''}">\${SI[r.severity]||''} \${r.severity}</td>
+        <td class="px-4 py-3 text-xs text-zinc-400">\${r.scoreDrop>0?'−'+r.scoreDrop+'pts':'0pts'}</td>
+        <td class="px-4 py-3 text-xs text-zinc-500">\${r.recordCount}</td>
+        <td class="px-4 py-3 text-xs \${VC[r.latestVerdict]||''}">\${r.latestVerdict}</td>
+      </tr>\`).join('');
+  }catch(e){
+    document.getElementById('status-line').textContent='error: '+e.message;
+  }
+}
+refresh();
+let t=30;
+setInterval(()=>{
+  t--;
+  if(t<=0){t=30;refresh();}
+  document.getElementById('next-refresh').textContent='refresh in '+t+'s';
+},1000);
+</script>
+</body>
+</html>`;
+
