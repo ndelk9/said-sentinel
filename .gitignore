@@ -1,0 +1,20 @@
+# Environment variables - never commit these
+.env
+.env.local
+.env*.local
+wallet.json
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Database
+.eliza/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
