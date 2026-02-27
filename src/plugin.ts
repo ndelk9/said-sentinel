@@ -24,6 +24,9 @@ const RPC_URL = process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solana.c
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TELEGRAM_AUDIT_CHANNEL = process.env.TELEGRAM_AUDIT_CHANNEL_ID ?? '';
 const WATCHER_POLL_MS = parseInt(process.env.WATCHER_POLL_INTERVAL_MS ?? '300000', 10); // 5 min
+const REAUDIT_INTERVAL_MS = parseInt(process.env.REAUDIT_INTERVAL_MS ?? '21600000', 10); // 6 hours
+const REAUDIT_BATCH_SIZE = parseInt(process.env.REAUDIT_BATCH_SIZE ?? '20', 10);
+const REAUDIT_DELAY_MS = parseInt(process.env.REAUDIT_DELAY_MS ?? '1000', 10); // 1s between agents
 
 // ─── Config Schema ────────────────────────────────────────────────────────────
 const configSchema = z.object({
@@ -58,7 +61,16 @@ interface SaidAuditResult {
   };
 }
 
+interface AuditSnapshot {
+  verdict: AuditVerdict;
+  confidenceScore: number;
+  timestamp: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 function isTxSignature(str: string): boolean {
   return /^[1-9A-HJ-NP-Za-km-z]{87,88}$/.test(str.trim());
 }
@@ -165,6 +177,50 @@ function formatAuditBroadcast(agent: AgentIdentity, audit: SaidAuditResult): str
 
   lines.push(``);
   lines.push(`_Said Sentinel • ${new Date(audit.timestamp).toUTCString()}_`);
+
+  return lines.join('\n');
+}
+
+function formatReauditBroadcast(
+  wallet: string,
+  audit: SaidAuditResult,
+  prev: AuditSnapshot | null
+): string {
+  const verdictEmoji = audit.verdict === 'PASS' ? '✅' : audit.verdict === 'FAIL' ? '❌' : '⚠️';
+
+  let headerEmoji = '🔄';
+  if (prev) {
+    if (audit.verdict === 'FAIL' && prev.verdict !== 'FAIL') headerEmoji = '🚨';
+    else if (audit.verdict === 'PASS' && prev.verdict !== 'PASS') headerEmoji = '📈';
+    else if (audit.verdict === 'WARNING' && prev.verdict === 'PASS') headerEmoji = '📉';
+  }
+
+  const lines: string[] = [
+    `${headerEmoji} *Re-Audit Alert*`,
+    ``,
+    `Wallet: \`${wallet}\``,
+    `${verdictEmoji} *${audit.verdict}* (${(audit.confidenceScore * 100).toFixed(0)}% confidence)`,
+  ];
+
+  if (prev) {
+    lines.push(`Change: *${prev.verdict} → ${audit.verdict}*`);
+    const scoreDelta = (audit.confidenceScore - prev.confidenceScore) * 100;
+    if (Math.abs(scoreDelta) >= 5) {
+      lines.push(`Score drift: ${scoreDelta > 0 ? '+' : ''}${scoreDelta.toFixed(0)}%`);
+    }
+  }
+
+  if (audit.findings.length > 0) {
+    lines.push(``);
+    lines.push(`*Findings:*`);
+    for (const f of audit.findings) {
+      const icon = f.severity === 'HIGH' ? '🔴' : f.severity === 'MEDIUM' ? '🟡' : '🟢';
+      lines.push(`${icon} ${f.issue}`);
+    }
+  }
+
+  lines.push(``);
+  lines.push(`_Said Sentinel Re-Auditor • ${new Date(audit.timestamp).toUTCString()}_`);
 
   return lines.join('\n');
 }
@@ -368,6 +424,14 @@ export class SaidSentinelService extends Service {
   watcherTimer: ReturnType<typeof setInterval> | null = null;
   watcherStartedAt: Date | null = null;
 
+  // Re-Auditor state
+  auditHistory: Map<string, AuditSnapshot> = new Map();
+  reauditorTimer: ReturnType<typeof setInterval> | null = null;
+  reauditorRunning = false;
+  reauditorLastRun: Date | null = null;
+  reauditorNextRun: Date | null = null;
+  reauditorLastCycleStats: { audited: number; alerts: number } | null = null;
+
   constructor(runtime: IAgentRuntime) {
     super(runtime);
   }
@@ -380,8 +444,9 @@ export class SaidSentinelService extends Service {
     svc.saidClient = new SAID({ rpcUrl: RPC_URL, commitment: 'confirmed' });
     logger.info({ pubkey: svc.keypair.publicKey.toString() }, 'Said Sentinel keypair loaded');
 
-    // Start the autonomous New Agent Watcher
+    // Start autonomous background services
     await svc.startWatcher();
+    svc.startReauditor();
 
     return svc;
   }
@@ -392,6 +457,7 @@ export class SaidSentinelService extends Service {
 
   async stop(): Promise<void> {
     this.stopWatcher();
+    this.stopReauditor();
   }
 
   // ─── New Agent Watcher ─────────────────────────────────────────────────────
@@ -429,6 +495,115 @@ export class SaidSentinelService extends Service {
       this.watcherTimer = null;
       logger.info('New Agent Watcher: stopped');
     }
+  }
+
+  // ─── Continuous Re-Auditor ─────────────────────────────────────────────────
+  startReauditor(): void {
+    this.reauditorNextRun = new Date(Date.now() + REAUDIT_INTERVAL_MS);
+    this.reauditorTimer = setInterval(() => {
+      void this.runReauditCycle();
+    }, REAUDIT_INTERVAL_MS);
+    logger.info(
+      {
+        intervalHours: (REAUDIT_INTERVAL_MS / 3600000).toFixed(1),
+        batchSize: REAUDIT_BATCH_SIZE,
+        delayMs: REAUDIT_DELAY_MS,
+        firstRunAt: this.reauditorNextRun.toUTCString(),
+      },
+      'Continuous Re-Auditor: scheduled'
+    );
+  }
+
+  stopReauditor(): void {
+    if (this.reauditorTimer) {
+      clearInterval(this.reauditorTimer);
+      this.reauditorTimer = null;
+      logger.info('Continuous Re-Auditor: stopped');
+    }
+  }
+
+  async runReauditCycle(force = false): Promise<{ audited: number; alerts: number }> {
+    if (this.reauditorRunning && !force) {
+      logger.warn('Continuous Re-Auditor: previous cycle still running, skipping');
+      return { audited: 0, alerts: 0 };
+    }
+
+    this.reauditorRunning = true;
+    this.reauditorLastRun = new Date();
+    this.reauditorNextRun = new Date(Date.now() + REAUDIT_INTERVAL_MS);
+
+    const wallets = Array.from(this.knownAgentWallets).slice(0, REAUDIT_BATCH_SIZE);
+    logger.info(
+      { total: this.knownAgentWallets.size, auditing: wallets.length },
+      'Continuous Re-Auditor: cycle started'
+    );
+
+    let audited = 0;
+    let alerts = 0;
+
+    try {
+      for (const wallet of wallets) {
+        try {
+          const { findings, confidenceScore } = await auditIdentityPDA(wallet, this.saidClient);
+          const verdict = deriveVerdict(findings, confidenceScore);
+          const prev = this.auditHistory.get(wallet) ?? null;
+
+          const verdictChanged = prev !== null && prev.verdict !== verdict;
+          const isFirstAuditAlert =
+            prev === null && (verdict === 'FAIL' || verdict === 'WARNING');
+
+          // Update history before broadcasting
+          this.auditHistory.set(wallet, {
+            verdict,
+            confidenceScore: Math.round(confidenceScore * 100) / 100,
+            timestamp: new Date().toISOString(),
+          });
+
+          // Broadcast only on changes or first-time alerts — never spam unchanged PASSes
+          if (verdictChanged || isFirstAuditAlert) {
+            const payload: Omit<SaidAuditResult, 'attestation'> = {
+              protocol: 'SAID_v1',
+              auditId: crypto.randomUUID(),
+              timestamp: new Date().toISOString(),
+              target: wallet,
+              verdict,
+              confidenceScore: Math.round(confidenceScore * 100) / 100,
+              findings,
+            };
+            const signature = signPayload(payload, this.keypair);
+            const auditResult: SaidAuditResult = {
+              ...payload,
+              attestation: { auditor: this.keypair.publicKey.toString(), signature },
+            };
+
+            await broadcastToTelegram(formatReauditBroadcast(wallet, auditResult, prev));
+            alerts++;
+
+            logger.info(
+              { wallet, prev: prev?.verdict ?? 'NEW', current: verdict },
+              'Continuous Re-Auditor: verdict change detected and broadcast'
+            );
+          }
+
+          audited++;
+        } catch (err) {
+          logger.warn({ err, wallet }, 'Continuous Re-Auditor: audit failed for wallet, skipping');
+        }
+
+        // Rate limit: pause between each agent
+        await sleep(REAUDIT_DELAY_MS);
+      }
+    } finally {
+      this.reauditorRunning = false;
+      this.reauditorLastCycleStats = { audited, alerts };
+    }
+
+    logger.info(
+      { audited, alerts, skipped: wallets.length - audited },
+      'Continuous Re-Auditor: cycle complete'
+    );
+
+    return { audited, alerts };
   }
 
   async checkForNewAgents(): Promise<void> {
@@ -784,11 +959,12 @@ const listAgentsAction: Action = {
 // ─── Action: WATCHER_STATUS ───────────────────────────────────────────────────
 const watcherStatusAction: Action = {
   name: 'WATCHER_STATUS',
-  similes: ['WATCHER_INFO', 'MONITORING_STATUS', 'CHECK_WATCHER'],
-  description: 'Reports the current status of the autonomous New Agent Watcher.',
+  similes: ['WATCHER_INFO', 'MONITORING_STATUS', 'CHECK_WATCHER', 'REAUDITOR_STATUS'],
+  description:
+    'Reports the current status of both the New Agent Watcher and the Continuous Re-Auditor.',
 
   validate: async (_runtime: IAgentRuntime, message: Memory): Promise<boolean> => {
-    return /watcher|monitoring|watching|auto.?audit|new agent.*watch/i.test(
+    return /watcher|monitoring|watching|auto.?audit|new agent.*watch|re.?audit.*status|monitoring status/i.test(
       message.content.text ?? ''
     );
   },
@@ -806,37 +982,116 @@ const watcherStatusAction: Action = {
       return { success: false, text: 'Service unavailable' };
     }
 
-    const isRunning = svc.watcherTimer !== null;
-    const statusEmoji = isRunning ? '🟢' : '🔴';
     const channelConfigured = Boolean(TELEGRAM_AUDIT_CHANNEL);
+    const watcherRunning = svc.watcherTimer !== null;
+    const reauditorRunning = svc.reauditorTimer !== null;
 
     const lines = [
-      `**New Agent Watcher Status**`,
-      `${statusEmoji} Status: ${isRunning ? 'Running' : 'Stopped'}`,
+      `**Said Sentinel — Monitoring Status**`,
+      ``,
+      `**New Agent Watcher**`,
+      `${watcherRunning ? '🟢' : '🔴'} ${watcherRunning ? 'Running' : 'Stopped'}`,
       `Started: ${svc.watcherStartedAt?.toUTCString() ?? 'N/A'}`,
-      `Poll Interval: ${WATCHER_POLL_MS / 60000} minutes`,
-      `Agents Tracked: ${svc.knownAgentWallets.size}`,
-      `Telegram Broadcast: ${channelConfigured ? `✅ Channel configured` : '⚠️ TELEGRAM_AUDIT_CHANNEL_ID not set'}`,
+      `Poll interval: every ${WATCHER_POLL_MS / 60000} min`,
+      `Agents tracked: ${svc.knownAgentWallets.size}`,
+      ``,
+      `**Continuous Re-Auditor**`,
+      `${reauditorRunning ? '🟢' : '🔴'} ${reauditorRunning ? 'Scheduled' : 'Stopped'}${svc.reauditorRunning ? ' *(cycle in progress)*' : ''}`,
+      `Interval: every ${(REAUDIT_INTERVAL_MS / 3600000).toFixed(1)}h | Batch: ${REAUDIT_BATCH_SIZE} agents | Delay: ${REAUDIT_DELAY_MS}ms`,
+      `Last run: ${svc.reauditorLastRun?.toUTCString() ?? 'Not yet run'}`,
+      `Next run: ${svc.reauditorNextRun?.toUTCString() ?? 'N/A'}`,
+      `Last cycle: ${svc.reauditorLastCycleStats ? `${svc.reauditorLastCycleStats.audited} audited, ${svc.reauditorLastCycleStats.alerts} alerts` : 'N/A'}`,
+      `History entries: ${svc.auditHistory.size}`,
+      ``,
+      `**Broadcast**`,
+      `${channelConfigured ? '✅ Telegram channel configured' : '⚠️ TELEGRAM_AUDIT_CHANNEL_ID not set'}`,
     ];
 
     await callback({ text: lines.join('\n'), actions: ['WATCHER_STATUS'] });
 
     return {
       success: true,
-      text: `Watcher is ${isRunning ? 'running' : 'stopped'}, tracking ${svc.knownAgentWallets.size} agents`,
-      values: { isRunning, trackedCount: svc.knownAgentWallets.size },
+      text: `Watcher: ${watcherRunning ? 'running' : 'stopped'}, Re-auditor: ${reauditorRunning ? 'scheduled' : 'stopped'}`,
+      values: { watcherRunning, reauditorRunning, trackedCount: svc.knownAgentWallets.size },
       data: {},
     };
   },
 
   examples: [
     [
-      { name: '{{name1}}', content: { text: 'What is the watcher status?' } },
+      { name: '{{name1}}', content: { text: 'What is the monitoring status?' } },
       {
         name: 'Said Sentinel',
         content: {
-          text: '**New Agent Watcher Status**\n🟢 Status: Running...',
+          text: '**Said Sentinel — Monitoring Status**\n\n**New Agent Watcher**\n🟢 Running...',
           actions: ['WATCHER_STATUS'],
+        },
+      },
+    ],
+  ],
+};
+
+// ─── Action: REAUDIT_NOW ──────────────────────────────────────────────────────
+const reauditNowAction: Action = {
+  name: 'REAUDIT_NOW',
+  similes: ['RUN_REAUDIT', 'TRIGGER_REAUDIT', 'AUDIT_ALL', 'START_REAUDIT_CYCLE'],
+  description:
+    'Manually triggers an immediate re-audit cycle across all known agents, ignoring the schedule.',
+
+  validate: async (_runtime: IAgentRuntime, message: Memory): Promise<boolean> => {
+    return /re.?audit now|run.*re.?audit|trigger.*re.?audit|audit all agents|force.*re.?audit/i.test(
+      message.content.text ?? ''
+    );
+  },
+
+  handler: async (
+    runtime: IAgentRuntime,
+    _message: Memory,
+    _state: State,
+    _options: unknown,
+    callback: HandlerCallback
+  ): Promise<ActionResult> => {
+    const svc = runtime.getService<SaidSentinelService>(SaidSentinelService.serviceType);
+    if (!svc) {
+      await callback({ text: 'Said Sentinel service not available.', actions: [] });
+      return { success: false, text: 'Service unavailable' };
+    }
+
+    if (svc.reauditorRunning) {
+      await callback({
+        text: `A re-audit cycle is already in progress. Check back shortly.`,
+        actions: [],
+      });
+      return { success: false, text: 'Cycle already running' };
+    }
+
+    const total = Math.min(svc.knownAgentWallets.size, REAUDIT_BATCH_SIZE);
+    await callback({
+      text: `Starting re-audit cycle for up to **${total}** agents (${REAUDIT_DELAY_MS}ms between each). I'll report when done.`,
+      actions: ['REAUDIT_NOW'],
+    });
+
+    // Run in background — don't await in handler
+    void svc.runReauditCycle(true).then(({ audited, alerts }) => {
+      logger.info({ audited, alerts }, 'REAUDIT_NOW: manual cycle complete');
+    });
+
+    return {
+      success: true,
+      text: `Re-audit cycle started for ${total} agents`,
+      values: { total },
+      data: {},
+    };
+  },
+
+  examples: [
+    [
+      { name: '{{name1}}', content: { text: 'Reaudit all agents now' } },
+      {
+        name: 'Said Sentinel',
+        content: {
+          text: 'Starting re-audit cycle for up to **20** agents...',
+          actions: ['REAUDIT_NOW'],
         },
       },
     ],
@@ -897,7 +1152,7 @@ const saidPlugin: Plugin = {
     }
   },
   services: [SaidSentinelService],
-  actions: [performSaidAuditAction, listAgentsAction, watcherStatusAction],
+  actions: [performSaidAuditAction, listAgentsAction, watcherStatusAction, reauditNowAction],
   providers: [saidTrustProvider],
   evaluators: [auditOpportunityEvaluator],
 };
