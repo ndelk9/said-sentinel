@@ -16,6 +16,7 @@ import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { SAID, type AgentIdentity } from 'said-sdk';
 import nacl from 'tweetnacl';
 import { z } from 'zod';
+import { Scraper } from 'agent-twitter-client';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const SAID_PROGRAM_ID =
@@ -25,6 +26,9 @@ const RPC_URL = process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solana.c
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TELEGRAM_AUDIT_CHANNEL = process.env.TELEGRAM_AUDIT_CHANNEL_ID ?? '';
 const WATCHER_POLL_MS = parseInt(process.env.WATCHER_POLL_INTERVAL_MS ?? '300000', 10); // 5 min
+const TWITTER_USERNAME = process.env.TWITTER_USERNAME ?? '';
+const TWITTER_PASSWORD = process.env.TWITTER_PASSWORD ?? '';
+const TWITTER_EMAIL = process.env.TWITTER_EMAIL ?? '';
 const PASSPORT_PROGRAM_ID = 'L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95';
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const STALENESS_THRESHOLD_DAYS = 90;
@@ -240,6 +244,84 @@ async function broadcastToTelegram(text: string): Promise<void> {
   } catch (err) {
     logger.warn({ err }, 'Telegram broadcast error');
   }
+}
+
+// ─── X (Twitter) Broadcast ────────────────────────────────────────────────────
+let xScraper: Scraper | null = null;
+
+async function initTwitter(): Promise<void> {
+  if (!TWITTER_USERNAME || !TWITTER_PASSWORD) {
+    logger.info('X integration skipped: TWITTER_USERNAME/TWITTER_PASSWORD not configured');
+    return;
+  }
+  try {
+    const scraper = new Scraper();
+    await scraper.login(TWITTER_USERNAME, TWITTER_PASSWORD, TWITTER_EMAIL || undefined);
+    xScraper = scraper;
+    logger.info({ username: TWITTER_USERNAME }, 'X: logged in');
+  } catch (err) {
+    logger.warn({ err }, 'X: login failed — posts will be skipped');
+  }
+}
+
+async function postToX(text: string): Promise<void> {
+  if (!xScraper) return;
+  try {
+    // ≤280 chars → sendTweet; longer → sendLongTweet (Note Tweet)
+    if (text.length <= 280) {
+      await xScraper.sendTweet(text);
+    } else {
+      await xScraper.sendLongTweet(text);
+    }
+    logger.debug({ chars: text.length }, 'X: post sent');
+  } catch (err) {
+    logger.warn({ err }, 'X: post failed');
+  }
+}
+
+function xAuditPost(agent: AgentIdentity, audit: SaidAuditResult): string {
+  const emoji = audit.verdict === 'PASS' ? '✅' : audit.verdict === 'FAIL' ? '❌' : '⚠️';
+  const name = agent.card?.name ?? agent.owner.slice(0, 8) + '…';
+  const twitter = agent.card?.twitter ? ` (@${agent.card.twitter})` : '';
+  const findings = audit.findings.length > 0 ? `\n${audit.findings.length} finding(s)` : '';
+  return [
+    `🔍 New agent on Said Protocol`,
+    ``,
+    `${emoji} ${audit.verdict} — ${name}${twitter}`,
+    `Wallet: ${agent.owner.slice(0, 8)}…${agent.owner.slice(-4)}${findings}`,
+    ``,
+    `#SaidProtocol #Solana`,
+  ].join('\n');
+}
+
+function xReauditPost(wallet: string, audit: SaidAuditResult, prev: AuditSnapshot | null): string {
+  const emoji = audit.verdict === 'PASS' ? '✅' : audit.verdict === 'FAIL' ? '❌' : '⚠️';
+  const header = prev?.verdict && prev.verdict !== audit.verdict
+    ? `${prev.verdict} → ${audit.verdict}`
+    : audit.verdict;
+  return [
+    `🚨 Said Sentinel Re-Audit Alert`,
+    ``,
+    `${emoji} ${header}`,
+    `Agent: ${wallet.slice(0, 8)}…${wallet.slice(-4)}`,
+    audit.findings.length > 0 ? `${audit.findings.length} finding(s)` : 'No issues',
+    ``,
+    `#SaidProtocol #Solana`,
+  ].join('\n');
+}
+
+function xDriftPost(analysis: DriftAnalysis): string {
+  const icons: Record<DriftSeverity, string> = { NONE: '✅', MILD: '🟡', MODERATE: '🟠', SEVERE: '🔴' };
+  return [
+    `${icons[analysis.severity]} Reputation Drift: ${analysis.severity}`,
+    ``,
+    `Agent: ${analysis.wallet.slice(0, 8)}…${analysis.wallet.slice(-4)}`,
+    `Score: ${(analysis.baselineScore * 100).toFixed(0)}% → ${(analysis.latestScore * 100).toFixed(0)}%`,
+    `${analysis.recordCount} audits tracked`,
+    ``,
+    `→ t.me/SaidSentinelAlerts`,
+    `#SaidProtocol #Solana`,
+  ].join('\n');
 }
 
 function formatAuditBroadcast(agent: AgentIdentity, audit: SaidAuditResult): string {
@@ -653,6 +735,9 @@ export class SaidSentinelService extends Service {
     // Load persisted drift history before starting background services
     await svc.loadDriftHistory();
 
+    // Initialize X integration (non-fatal)
+    await initTwitter();
+
     // Start autonomous background services
     await svc.startWatcher();
     svc.startReauditor();
@@ -869,6 +954,21 @@ export class SaidSentinelService extends Service {
     ];
 
     await broadcastToTelegram(lines.join('\n'));
+
+    // Compact X version of the digest
+    const xDigest = [
+      `📋 Said Sentinel Daily Report`,
+      ``,
+      `• ${total} agents tracked, ${verified} verified`,
+      `• Watcher: ${this.knownAgentWallets.size} wallets`,
+      cycleStats ? `• Re-audit: ${cycleStats.audited} audited, ${cycleStats.alerts} alerts` : `• No re-audit cycle yet`,
+      atRisk.length > 0 ? `• At-risk: ${atRisk.map((a) => `${a.severity}`).join(', ')}` : `• No high-risk agents`,
+      ``,
+      `→ t.me/SaidSentinelAlerts`,
+      `#SaidProtocol #Solana`,
+    ].join('\n');
+    await postToX(xDigest);
+
     logger.info('Daily Digest: sent');
   }
 
@@ -936,6 +1036,7 @@ export class SaidSentinelService extends Service {
           if (severityRank(driftAnalysis.severity) > severityRank(prevSeverity)) {
             this.driftSeverityCache.set(wallet, driftAnalysis.severity);
             await broadcastToTelegram(formatDriftAlert(driftAnalysis));
+            await postToX(xDriftPost(driftAnalysis));
             logger.info(
               { wallet, prevSeverity, newSeverity: driftAnalysis.severity },
               'Drift Monitor: severity worsened, alert broadcast'
@@ -962,6 +1063,7 @@ export class SaidSentinelService extends Service {
             };
 
             await broadcastToTelegram(formatReauditBroadcast(wallet, auditResult, prev));
+            await postToX(xReauditPost(wallet, auditResult, prev));
             alerts++;
 
             logger.info(
@@ -1067,6 +1169,7 @@ export class SaidSentinelService extends Service {
 
     const broadcastMessage = formatAuditBroadcast(agent, auditResult);
     await broadcastToTelegram(broadcastMessage);
+    await postToX(xAuditPost(agent, auditResult));
 
     logger.info(
       { wallet: agent.owner, verdict, auditId: auditResult.auditId, name: displayName },
