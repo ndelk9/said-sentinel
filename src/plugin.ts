@@ -25,6 +25,9 @@ const RPC_URL = process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solana.c
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TELEGRAM_AUDIT_CHANNEL = process.env.TELEGRAM_AUDIT_CHANNEL_ID ?? '';
 const WATCHER_POLL_MS = parseInt(process.env.WATCHER_POLL_INTERVAL_MS ?? '300000', 10); // 5 min
+const PASSPORT_PROGRAM_ID = 'L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95';
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+const STALENESS_THRESHOLD_DAYS = 90;
 const REAUDIT_INTERVAL_MS = parseInt(process.env.REAUDIT_INTERVAL_MS ?? '21600000', 10); // 6 hours
 const REAUDIT_BATCH_SIZE = parseInt(process.env.REAUDIT_BATCH_SIZE ?? '20', 10);
 const REAUDIT_DELAY_MS = parseInt(process.env.REAUDIT_DELAY_MS ?? '1000', 10); // 1s between agents
@@ -394,7 +397,8 @@ async function auditTransaction(
 
 async function auditIdentityPDA(
   address: string,
-  saidClient: SAID
+  saidClient: SAID,
+  connection: Connection
 ): Promise<{ findings: AuditFinding[]; confidenceScore: number }> {
   const findings: AuditFinding[] = [];
   let confidenceScore = 1.0;
@@ -458,6 +462,101 @@ async function auditIdentityPDA(
       });
       confidenceScore -= 0.05;
     }
+    // ── Passport NFT check ────────────────────────────────────────────────────
+    try {
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+        new PublicKey(address),
+        { programId: TOKEN_2022_PROGRAM_ID }
+      );
+      // A passport is a Token-2022 NFT: amount=1, decimals=0
+      const hasPassport = tokenAccounts.value.some((acc) => {
+        const info = acc.account.data.parsed?.info as
+          | { tokenAmount?: { amount?: string; decimals?: number } }
+          | undefined;
+        return info?.tokenAmount?.amount === '1' && info?.tokenAmount?.decimals === 0;
+      });
+      if (!hasPassport) {
+        findings.push({
+          issue: 'No Said Protocol Passport NFT found for this agent wallet',
+          severity: 'MEDIUM',
+          remediation: 'Mint a Passport NFT at saidprotocol.com (costs ~0.056 SOL)',
+        });
+        confidenceScore -= 0.15;
+      }
+    } catch {
+      // Non-fatal — RPC error, skip passport check
+    }
+
+    // ── Metadata URI validation ───────────────────────────────────────────────
+    if (!agent.metadataUri) {
+      findings.push({
+        issue: 'Agent has no metadataUri set on-chain',
+        severity: 'LOW',
+        remediation: 'Set a metadataUri pointing to valid agent metadata JSON.',
+      });
+      confidenceScore -= 0.1;
+    } else {
+      try {
+        const metaResp = await fetch(agent.metadataUri, { signal: AbortSignal.timeout(5000) });
+        if (!metaResp.ok) {
+          findings.push({
+            issue: `metadataUri returned HTTP ${metaResp.status}: ${agent.metadataUri}`,
+            severity: 'MEDIUM',
+            remediation: 'Ensure the metadata URI is publicly accessible and returns valid JSON.',
+          });
+          confidenceScore -= 0.15;
+        } else {
+          const meta = (await metaResp.json()) as Record<string, unknown>;
+          for (const field of ['name', 'description']) {
+            if (!meta[field]) {
+              findings.push({
+                issue: `Agent metadata missing field: "${field}"`,
+                severity: 'LOW',
+                remediation: `Add "${field}" to the metadata JSON at ${agent.metadataUri}`,
+              });
+              confidenceScore -= 0.05;
+            }
+          }
+        }
+      } catch {
+        findings.push({
+          issue: `metadataUri is unreachable: ${agent.metadataUri}`,
+          severity: 'MEDIUM',
+          remediation: 'Ensure the metadata URI is publicly accessible.',
+        });
+        confidenceScore -= 0.15;
+      }
+    }
+
+    // ── Staleness detection ───────────────────────────────────────────────────
+    // registeredAt / verifiedAt come from Solana block time (Unix seconds)
+    const toMs = (t: number) => (t > 1e12 ? t : t * 1000);
+    const daysSince = (t: number) => (Date.now() - toMs(t)) / 86_400_000;
+
+    if (agent.registeredAt) {
+      const ageDays = daysSince(agent.registeredAt);
+      if (!agent.isVerified && ageDays > STALENESS_THRESHOLD_DAYS) {
+        findings.push({
+          issue: `Agent registered ${Math.floor(ageDays)} days ago but has never been verified`,
+          severity: 'MEDIUM',
+          remediation: 'Complete verification or decommission the agent.',
+        });
+        confidenceScore -= 0.2;
+      }
+    }
+
+    if (agent.isVerified && agent.verifiedAt) {
+      const staleDays = daysSince(agent.verifiedAt);
+      if (staleDays > STALENESS_THRESHOLD_DAYS) {
+        findings.push({
+          issue: `Verification is ${Math.floor(staleDays)} days old — identity may be stale`,
+          severity: 'LOW',
+          remediation: 'Re-verify the agent to confirm it is still active.',
+        });
+        confidenceScore -= 0.1;
+      }
+    }
+
   } catch (err) {
     findings.push({
       issue: `Invalid Solana address or RPC error: ${err instanceof Error ? err.message : String(err)}`,
@@ -812,7 +911,7 @@ export class SaidSentinelService extends Service {
     try {
       for (const wallet of wallets) {
         try {
-          const { findings, confidenceScore } = await auditIdentityPDA(wallet, this.saidClient);
+          const { findings, confidenceScore } = await auditIdentityPDA(wallet, this.saidClient, this.connection);
           const verdict = deriveVerdict(findings, confidenceScore);
           const prev = this.auditHistory.get(wallet) ?? null;
 
@@ -935,7 +1034,7 @@ export class SaidSentinelService extends Service {
     let confidenceScore = 1.0;
 
     try {
-      ({ findings, confidenceScore } = await auditIdentityPDA(agent.owner, this.saidClient));
+      ({ findings, confidenceScore } = await auditIdentityPDA(agent.owner, this.saidClient, this.connection));
     } catch (err) {
       logger.warn({ err, wallet: agent.owner }, 'New Agent Watcher: audit failed');
       findings = [{
@@ -1074,7 +1173,7 @@ const performSaidAuditAction: Action = {
       ({ findings, confidenceScore } = await auditA2AEnvelope(JSON.parse(text) as object));
     } else if (isSolanaAddress(target)) {
       auditType = 'IDENTITY';
-      ({ findings, confidenceScore } = await auditIdentityPDA(target, svc.saidClient));
+      ({ findings, confidenceScore } = await auditIdentityPDA(target, svc.saidClient, svc.connection));
     } else {
       await callback({
         text: `Cannot determine audit target from: "${target}". Provide a transaction signature, Solana address, or A2A JSON envelope.`,
