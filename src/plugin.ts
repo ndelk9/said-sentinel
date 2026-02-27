@@ -11,6 +11,7 @@ import type {
   ProviderResult,
 } from '@elizaos/core';
 import { Service, logger } from '@elizaos/core';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { SAID, type AgentIdentity } from 'said-sdk';
 import nacl from 'tweetnacl';
@@ -67,6 +68,26 @@ interface AuditSnapshot {
   timestamp: string;
 }
 
+type DriftSeverity = 'NONE' | 'MILD' | 'MODERATE' | 'SEVERE';
+
+interface DriftRecord {
+  timestamp: string;
+  verdict: AuditVerdict;
+  confidenceScore: number;
+}
+
+interface DriftAnalysis {
+  wallet: string;
+  recordCount: number;
+  latestVerdict: AuditVerdict;
+  baselineScore: number;
+  latestScore: number;
+  scoreDrop: number;       // baseline - latest (positive = getting worse)
+  scoreTrend: number;      // slope over last 5 records (negative = declining)
+  consecutiveAlerts: number;
+  severity: DriftSeverity;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -112,6 +133,83 @@ function deriveVerdict(findings: AuditFinding[], score: number): AuditVerdict {
   if (findings.some((f) => f.severity === 'HIGH')) return 'FAIL';
   if (findings.some((f) => f.severity === 'MEDIUM') || score < 0.8) return 'WARNING';
   return 'PASS';
+}
+
+const DRIFT_HISTORY_FILE = '/app/data/drift-history.json';
+const DRIFT_MAX_RECORDS = 50; // max records kept per agent
+
+function computeDriftAnalysis(wallet: string, records: DriftRecord[]): DriftAnalysis {
+  const latest = records[records.length - 1];
+  const baseline = records[0];
+
+  // Score trend: slope over last 5 records (negative = declining)
+  const recent = records.slice(-5);
+  const scoreTrend =
+    recent.length > 1
+      ? (recent[recent.length - 1].confidenceScore - recent[0].confidenceScore) /
+        (recent.length - 1)
+      : 0;
+
+  // Consecutive non-PASS count from the end
+  let consecutiveAlerts = 0;
+  for (let i = records.length - 1; i >= 0; i--) {
+    if (records[i].verdict !== 'PASS') consecutiveAlerts++;
+    else break;
+  }
+
+  const scoreDrop = baseline.confidenceScore - latest.confidenceScore;
+
+  // Severity ladder
+  let severity: DriftSeverity = 'NONE';
+  if (latest.verdict === 'FAIL' || consecutiveAlerts >= 4 || scoreDrop >= 0.3) {
+    severity = 'SEVERE';
+  } else if (consecutiveAlerts >= 3 || scoreDrop >= 0.2 || scoreTrend < -0.05) {
+    severity = 'MODERATE';
+  } else if (consecutiveAlerts >= 1 || scoreDrop >= 0.1 || scoreTrend < -0.02) {
+    severity = 'MILD';
+  }
+
+  return {
+    wallet,
+    recordCount: records.length,
+    latestVerdict: latest.verdict,
+    baselineScore: baseline.confidenceScore,
+    latestScore: latest.confidenceScore,
+    scoreDrop,
+    scoreTrend,
+    consecutiveAlerts,
+    severity,
+  };
+}
+
+function severityRank(s: DriftSeverity): number {
+  return { NONE: 0, MILD: 1, MODERATE: 2, SEVERE: 3 }[s];
+}
+
+function formatDriftAlert(analysis: DriftAnalysis): string {
+  const icons: Record<DriftSeverity, string> = {
+    NONE: '✅',
+    MILD: '🟡',
+    MODERATE: '🟠',
+    SEVERE: '🔴',
+  };
+  const icon = icons[analysis.severity];
+
+  const lines = [
+    `${icon} *Reputation Drift Detected*`,
+    ``,
+    `Wallet: \`${analysis.wallet}\``,
+    `Severity: *${analysis.severity}*`,
+    `Latest Verdict: ${analysis.latestVerdict}`,
+    `Consecutive Alerts: ${analysis.consecutiveAlerts}`,
+    `Score: ${(analysis.baselineScore * 100).toFixed(0)}% → ${(analysis.latestScore * 100).toFixed(0)}% (${analysis.scoreDrop > 0 ? '-' : '+'}${(Math.abs(analysis.scoreDrop) * 100).toFixed(0)}%)`,
+    `Trend (last 5): ${analysis.scoreTrend < 0 ? '📉' : '📈'} ${(analysis.scoreTrend * 100).toFixed(1)}%/audit`,
+    `Records: ${analysis.recordCount} audits tracked`,
+    ``,
+    `_Said Sentinel Drift Monitor • ${new Date().toUTCString()}_`,
+  ];
+
+  return lines.join('\n');
 }
 
 // ─── Telegram Broadcast ───────────────────────────────────────────────────────
@@ -433,6 +531,10 @@ export class SaidSentinelService extends Service {
   reauditorLastCycleStats: { audited: number; alerts: number } | null = null;
   reauditorOffset = 0; // rotating cursor — advances each cycle so all agents are covered
 
+  // Reputation Drift Monitor state
+  driftHistory: Map<string, DriftRecord[]> = new Map();
+  driftSeverityCache: Map<string, DriftSeverity> = new Map(); // last known severity per agent
+
   constructor(runtime: IAgentRuntime) {
     super(runtime);
   }
@@ -444,6 +546,9 @@ export class SaidSentinelService extends Service {
     svc.keypair = loadKeypair();
     svc.saidClient = new SAID({ rpcUrl: RPC_URL, commitment: 'confirmed' });
     logger.info({ pubkey: svc.keypair.publicKey.toString() }, 'Said Sentinel keypair loaded');
+
+    // Load persisted drift history before starting background services
+    await svc.loadDriftHistory();
 
     // Start autonomous background services
     await svc.startWatcher();
@@ -459,6 +564,50 @@ export class SaidSentinelService extends Service {
   async stop(): Promise<void> {
     this.stopWatcher();
     this.stopReauditor();
+  }
+
+  // ─── Reputation Drift Monitor ─────────────────────────────────────────────
+  async loadDriftHistory(): Promise<void> {
+    try {
+      const raw = await readFile(DRIFT_HISTORY_FILE, 'utf-8');
+      const parsed = JSON.parse(raw) as Record<string, DriftRecord[]>;
+      this.driftHistory = new Map(Object.entries(parsed));
+
+      // Restore auditHistory from the latest record so the re-auditor has context
+      for (const [wallet, records] of this.driftHistory) {
+        if (records.length > 0) {
+          const latest = records[records.length - 1];
+          this.auditHistory.set(wallet, latest);
+          const analysis = computeDriftAnalysis(wallet, records);
+          this.driftSeverityCache.set(wallet, analysis.severity);
+        }
+      }
+      logger.info(
+        { wallets: this.driftHistory.size },
+        'Drift history loaded from disk'
+      );
+    } catch {
+      logger.info('No existing drift history — starting fresh');
+    }
+  }
+
+  async saveDriftHistory(): Promise<void> {
+    try {
+      await mkdir('/app/data', { recursive: true });
+      const obj = Object.fromEntries(this.driftHistory);
+      await writeFile(DRIFT_HISTORY_FILE, JSON.stringify(obj));
+    } catch (err) {
+      logger.warn({ err }, 'Failed to save drift history');
+    }
+  }
+
+  appendDriftRecord(wallet: string, record: DriftRecord): DriftAnalysis {
+    const records = this.driftHistory.get(wallet) ?? [];
+    records.push(record);
+    // Keep only the last DRIFT_MAX_RECORDS entries
+    if (records.length > DRIFT_MAX_RECORDS) records.splice(0, records.length - DRIFT_MAX_RECORDS);
+    this.driftHistory.set(wallet, records);
+    return computeDriftAnalysis(wallet, records);
   }
 
   // ─── New Agent Watcher ─────────────────────────────────────────────────────
@@ -570,14 +719,32 @@ export class SaidSentinelService extends Service {
           const isFirstAuditAlert =
             prev === null && (verdict === 'FAIL' || verdict === 'WARNING');
 
-          // Update history before broadcasting
-          this.auditHistory.set(wallet, {
+          const snapshot: AuditSnapshot = {
             verdict,
             confidenceScore: Math.round(confidenceScore * 100) / 100,
             timestamp: new Date().toISOString(),
-          });
+          };
 
-          // Broadcast only on changes or first-time alerts — never spam unchanged PASSes
+          // Update in-memory audit history
+          this.auditHistory.set(wallet, snapshot);
+
+          // Append to persistent drift history and compute analysis
+          const driftAnalysis = this.appendDriftRecord(wallet, snapshot);
+          const prevSeverity = this.driftSeverityCache.get(wallet) ?? 'NONE';
+
+          // Broadcast drift alert if severity worsened
+          if (severityRank(driftAnalysis.severity) > severityRank(prevSeverity)) {
+            this.driftSeverityCache.set(wallet, driftAnalysis.severity);
+            await broadcastToTelegram(formatDriftAlert(driftAnalysis));
+            logger.info(
+              { wallet, prevSeverity, newSeverity: driftAnalysis.severity },
+              'Drift Monitor: severity worsened, alert broadcast'
+            );
+          } else {
+            this.driftSeverityCache.set(wallet, driftAnalysis.severity);
+          }
+
+          // Broadcast only on verdict changes or first-time alerts — never spam unchanged PASSes
           if (verdictChanged || isFirstAuditAlert) {
             const payload: Omit<SaidAuditResult, 'attestation'> = {
               protocol: 'SAID_v1',
@@ -614,6 +781,8 @@ export class SaidSentinelService extends Service {
     } finally {
       this.reauditorRunning = false;
       this.reauditorLastCycleStats = { audited, alerts };
+      // Persist drift history to disk after every cycle
+      await this.saveDriftHistory();
     }
 
     logger.info(
@@ -1116,6 +1285,123 @@ const reauditNowAction: Action = {
   ],
 };
 
+// ─── Action: DRIFT_REPORT ─────────────────────────────────────────────────────
+const driftReportAction: Action = {
+  name: 'DRIFT_REPORT',
+  similes: ['REPUTATION_DRIFT', 'SHOW_DRIFT', 'DRIFT_SUMMARY', 'TRUST_DRIFT', 'SCORE_TREND'],
+  description:
+    'Shows reputation drift analysis. Without a wallet address: leaderboard of most at-risk agents. With a wallet: full audit history and trend for that agent.',
+
+  validate: async (_runtime: IAgentRuntime, message: Memory): Promise<boolean> => {
+    return /drift|reputation.*trend|score.*trend|trust.*trend|at.?risk agents?/i.test(
+      message.content.text ?? ''
+    );
+  },
+
+  handler: async (
+    runtime: IAgentRuntime,
+    message: Memory,
+    _state: State,
+    _options: unknown,
+    callback: HandlerCallback
+  ): Promise<ActionResult> => {
+    const svc = runtime.getService<SaidSentinelService>(SaidSentinelService.serviceType);
+    if (!svc) {
+      await callback({ text: 'Said Sentinel service not available.', actions: [] });
+      return { success: false, text: 'Service unavailable' };
+    }
+
+    const text = message.content.text ?? '';
+    const walletMatch = text.match(/\b([1-9A-HJ-NP-Za-km-z]{32,44})\b/);
+
+    if (walletMatch) {
+      // Detailed report for a specific wallet
+      const wallet = walletMatch[1];
+      const records = svc.driftHistory.get(wallet);
+      if (!records || records.length === 0) {
+        await callback({
+          text: `No drift history found for \`${wallet}\`. It will be tracked after the next re-audit cycle.`,
+          actions: [],
+        });
+        return { success: false, text: 'No history for wallet' };
+      }
+
+      const analysis = computeDriftAnalysis(wallet, records);
+      const recentRecords = records.slice(-10).reverse();
+      const severityIcon: Record<DriftSeverity, string> = { NONE: '✅', MILD: '🟡', MODERATE: '🟠', SEVERE: '🔴' };
+
+      const lines = [
+        `**Drift Report — \`${wallet.slice(0, 12)}...\`**`,
+        `Severity: ${severityIcon[analysis.severity]} **${analysis.severity}**`,
+        `Consecutive alerts: ${analysis.consecutiveAlerts}`,
+        `Score: ${(analysis.baselineScore * 100).toFixed(0)}% → ${(analysis.latestScore * 100).toFixed(0)}% (${analysis.scoreDrop > 0 ? '-' : '+'}${(Math.abs(analysis.scoreDrop) * 100).toFixed(0)}%)`,
+        `Trend: ${analysis.scoreTrend < 0 ? '📉' : '📈'} ${(analysis.scoreTrend * 100).toFixed(1)}%/audit`,
+        ``,
+        `**Last ${recentRecords.length} audits:**`,
+        ...recentRecords.map((r) => {
+          const v = r.verdict === 'PASS' ? '✅' : r.verdict === 'FAIL' ? '❌' : '⚠️';
+          return `${v} ${r.verdict} ${(r.confidenceScore * 100).toFixed(0)}% — ${new Date(r.timestamp).toLocaleDateString()}`;
+        }),
+      ];
+
+      await callback({ text: lines.join('\n'), actions: ['DRIFT_REPORT'] });
+      return { success: true, text: `Drift severity: ${analysis.severity}`, values: { severity: analysis.severity }, data: { analysis } };
+    }
+
+    // Summary leaderboard — agents sorted by severity then score drop
+    if (svc.driftHistory.size === 0) {
+      await callback({
+        text: 'No drift history yet — run a re-audit cycle first.',
+        actions: [],
+      });
+      return { success: false, text: 'No history' };
+    }
+
+    const analyses = Array.from(svc.driftHistory.entries())
+      .filter(([, records]) => records.length > 0)
+      .map(([wallet, records]) => computeDriftAnalysis(wallet, records))
+      .sort((a, b) =>
+        severityRank(b.severity) - severityRank(a.severity) ||
+        b.scoreDrop - a.scoreDrop
+      );
+
+    const atRisk = analyses.filter((a) => a.severity !== 'NONE');
+    const severityIcon: Record<DriftSeverity, string> = { NONE: '✅', MILD: '🟡', MODERATE: '🟠', SEVERE: '🔴' };
+
+    const lines = [
+      `**Reputation Drift Leaderboard**`,
+      `Tracking ${analyses.length} agents | ${atRisk.length} at risk`,
+      ``,
+      ...analyses.slice(0, 15).map((a, i) => {
+        const icon = severityIcon[a.severity];
+        const trend = a.scoreTrend < -0.01 ? '📉' : a.scoreTrend > 0.01 ? '📈' : '➡️';
+        return `${i + 1}. ${icon} \`${a.wallet.slice(0, 10)}...\` ${trend} ${(a.latestScore * 100).toFixed(0)}% (${a.consecutiveAlerts} alerts)`;
+      }),
+    ];
+
+    await callback({ text: lines.join('\n'), actions: ['DRIFT_REPORT'] });
+    return {
+      success: true,
+      text: `${atRisk.length} agents at risk`,
+      values: { atRisk: atRisk.length, total: analyses.length },
+      data: { analyses: analyses.slice(0, 15) },
+    };
+  },
+
+  examples: [
+    [
+      { name: '{{name1}}', content: { text: 'Show reputation drift summary' } },
+      {
+        name: 'Said Sentinel',
+        content: {
+          text: '**Reputation Drift Leaderboard**\nTracking 27 agents | 3 at risk...',
+          actions: ['DRIFT_REPORT'],
+        },
+      },
+    ],
+  ],
+};
+
 // ─── Evaluator ────────────────────────────────────────────────────────────────
 const auditOpportunityEvaluator: Evaluator = {
   name: 'AUDIT_OPPORTUNITY_EVALUATOR',
@@ -1170,7 +1456,7 @@ const saidPlugin: Plugin = {
     }
   },
   services: [SaidSentinelService],
-  actions: [performSaidAuditAction, listAgentsAction, watcherStatusAction, reauditNowAction],
+  actions: [performSaidAuditAction, listAgentsAction, watcherStatusAction, reauditNowAction, driftReportAction],
   providers: [saidTrustProvider],
   evaluators: [auditOpportunityEvaluator],
 };
