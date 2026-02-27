@@ -12,7 +12,7 @@ import type {
 } from '@elizaos/core';
 import { Service, logger } from '@elizaos/core';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
-import { SAID } from 'said-sdk';
+import { SAID, type AgentIdentity } from 'said-sdk';
 import nacl from 'tweetnacl';
 import { z } from 'zod';
 
@@ -21,6 +21,9 @@ const SAID_PROGRAM_ID =
   process.env.SAID_PROGRAM_ID ?? '5dpw6KEQPn248pnkkaYyWfHwu2nfb3LUMbTucb6LaA8G';
 const SAID_API_ROOT = process.env.SAID_API_ROOT ?? 'https://api.saidprotocol.com';
 const RPC_URL = process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solana.com';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
+const TELEGRAM_AUDIT_CHANNEL = process.env.TELEGRAM_AUDIT_CHANNEL_ID ?? '';
+const WATCHER_POLL_MS = parseInt(process.env.WATCHER_POLL_INTERVAL_MS ?? '300000', 10); // 5 min
 
 // ─── Config Schema ────────────────────────────────────────────────────────────
 const configSchema = z.object({
@@ -97,6 +100,73 @@ function deriveVerdict(findings: AuditFinding[], score: number): AuditVerdict {
   if (findings.some((f) => f.severity === 'HIGH')) return 'FAIL';
   if (findings.some((f) => f.severity === 'MEDIUM') || score < 0.8) return 'WARNING';
   return 'PASS';
+}
+
+// ─── Telegram Broadcast ───────────────────────────────────────────────────────
+async function broadcastToTelegram(text: string): Promise<void> {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_AUDIT_CHANNEL) {
+    logger.debug('Telegram broadcast skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_AUDIT_CHANNEL_ID not configured');
+    return;
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_AUDIT_CHANNEL,
+        text,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      logger.warn({ status: res.status, body }, 'Telegram broadcast returned non-OK status');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Telegram broadcast error');
+  }
+}
+
+function formatAuditBroadcast(agent: AgentIdentity, audit: SaidAuditResult): string {
+  const verdictEmoji = audit.verdict === 'PASS' ? '✅' : audit.verdict === 'FAIL' ? '❌' : '⚠️';
+  const verifiedBadge = agent.isVerified ? '🔵 Verified' : '⬜ Unverified';
+  const displayName = agent.card?.name ?? `${agent.owner.slice(0, 8)}...`;
+
+  const lines: string[] = [
+    `🔍 *New Agent Detected on Said Protocol*`,
+    ``,
+    `*${displayName}* — ${verifiedBadge}`,
+    `Wallet: \`${agent.owner}\``,
+  ];
+
+  if (agent.card?.twitter) {
+    lines.push(`Twitter: @${agent.card.twitter}`);
+  }
+  if (agent.card?.description) {
+    lines.push(`_${agent.card.description}_`);
+  }
+
+  lines.push(``);
+  lines.push(`${verdictEmoji} *Audit Result: ${audit.verdict}* (${(audit.confidenceScore * 100).toFixed(0)}% confidence)`);
+  lines.push(`Audit ID: \`${audit.auditId.slice(0, 8)}\``);
+
+  if (audit.findings.length > 0) {
+    lines.push(``);
+    lines.push(`*Findings:*`);
+    for (const f of audit.findings) {
+      const icon = f.severity === 'HIGH' ? '🔴' : f.severity === 'MEDIUM' ? '🟡' : '🟢';
+      lines.push(`${icon} ${f.issue}`);
+    }
+  } else {
+    lines.push(`No issues found.`);
+  }
+
+  lines.push(``);
+  lines.push(`_Said Sentinel • ${new Date(audit.timestamp).toUTCString()}_`);
+
+  return lines.join('\n');
 }
 
 // ─── Audit Logic ──────────────────────────────────────────────────────────────
@@ -290,10 +360,13 @@ async function auditA2AEnvelope(
 export class SaidSentinelService extends Service {
   static serviceType = 'said-sentinel';
   capabilityDescription =
-    'Manages the Solana RPC connection and Sentinel keypair for Said Protocol audits.';
+    'Manages the Solana RPC connection, Sentinel keypair, and autonomous New Agent Watcher for Said Protocol audits.';
   connection!: Connection;
   keypair!: Keypair;
   saidClient!: SAID;
+  knownAgentWallets: Set<string> = new Set();
+  watcherTimer: ReturnType<typeof setInterval> | null = null;
+  watcherStartedAt: Date | null = null;
 
   constructor(runtime: IAgentRuntime) {
     super(runtime);
@@ -306,6 +379,10 @@ export class SaidSentinelService extends Service {
     svc.keypair = loadKeypair();
     svc.saidClient = new SAID({ rpcUrl: RPC_URL, commitment: 'confirmed' });
     logger.info({ pubkey: svc.keypair.publicKey.toString() }, 'Said Sentinel keypair loaded');
+
+    // Start the autonomous New Agent Watcher
+    await svc.startWatcher();
+
     return svc;
   }
 
@@ -313,7 +390,127 @@ export class SaidSentinelService extends Service {
     logger.info('*** Stopping SaidSentinelService ***');
   }
 
-  async stop(): Promise<void> {}
+  async stop(): Promise<void> {
+    this.stopWatcher();
+  }
+
+  // ─── New Agent Watcher ─────────────────────────────────────────────────────
+  async startWatcher(): Promise<void> {
+    logger.info({ pollMs: WATCHER_POLL_MS }, 'New Agent Watcher: initializing...');
+
+    // Seed the known-agents set so we don't re-audit existing agents on startup
+    try {
+      const existing = await this.saidClient.listAgents();
+      for (const agent of existing) {
+        this.knownAgentWallets.add(agent.owner);
+      }
+      logger.info(
+        { knownCount: this.knownAgentWallets.size },
+        'New Agent Watcher: seeded with existing agents'
+      );
+    } catch (err) {
+      logger.warn({ err }, 'New Agent Watcher: could not seed initial agent list — will audit all on first poll');
+    }
+
+    this.watcherStartedAt = new Date();
+    this.watcherTimer = setInterval(() => {
+      void this.checkForNewAgents();
+    }, WATCHER_POLL_MS);
+
+    logger.info(
+      { pollIntervalMinutes: WATCHER_POLL_MS / 60000 },
+      'New Agent Watcher: running'
+    );
+  }
+
+  stopWatcher(): void {
+    if (this.watcherTimer) {
+      clearInterval(this.watcherTimer);
+      this.watcherTimer = null;
+      logger.info('New Agent Watcher: stopped');
+    }
+  }
+
+  async checkForNewAgents(): Promise<void> {
+    logger.debug('New Agent Watcher: polling Said Protocol...');
+    let current: AgentIdentity[];
+
+    try {
+      current = await this.saidClient.listAgents({ includeCards: true });
+    } catch (err) {
+      logger.warn({ err }, 'New Agent Watcher: listAgents() failed — will retry next poll');
+      return;
+    }
+
+    const newAgents = current.filter((a) => !this.knownAgentWallets.has(a.owner));
+
+    if (newAgents.length === 0) {
+      logger.debug(
+        { totalKnown: this.knownAgentWallets.size },
+        'New Agent Watcher: no new agents detected'
+      );
+      return;
+    }
+
+    logger.info(
+      { newCount: newAgents.length, totalKnown: this.knownAgentWallets.size },
+      'New Agent Watcher: new agents detected!'
+    );
+
+    for (const agent of newAgents) {
+      // Register immediately so concurrent polls don't re-audit the same agent
+      this.knownAgentWallets.add(agent.owner);
+      await this.auditAndBroadcast(agent);
+    }
+  }
+
+  async auditAndBroadcast(agent: AgentIdentity): Promise<void> {
+    const displayName = agent.card?.name ?? agent.owner.slice(0, 12) + '...';
+    logger.info({ wallet: agent.owner, name: displayName }, 'New Agent Watcher: auditing new agent');
+
+    let findings: AuditFinding[] = [];
+    let confidenceScore = 1.0;
+
+    try {
+      ({ findings, confidenceScore } = await auditIdentityPDA(agent.owner, this.saidClient));
+    } catch (err) {
+      logger.warn({ err, wallet: agent.owner }, 'New Agent Watcher: audit failed');
+      findings = [{
+        issue: `Audit engine error: ${err instanceof Error ? err.message : String(err)}`,
+        severity: 'MEDIUM',
+        remediation: 'Retry the audit manually.',
+      }];
+      confidenceScore = 0.5;
+    }
+
+    const verdict = deriveVerdict(findings, confidenceScore);
+    const payload: Omit<SaidAuditResult, 'attestation'> = {
+      protocol: 'SAID_v1',
+      auditId: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      target: agent.owner,
+      verdict,
+      confidenceScore: Math.round(confidenceScore * 100) / 100,
+      findings,
+    };
+
+    const signature = signPayload(payload, this.keypair);
+    const auditResult: SaidAuditResult = {
+      ...payload,
+      attestation: {
+        auditor: this.keypair.publicKey.toString(),
+        signature,
+      },
+    };
+
+    const broadcastMessage = formatAuditBroadcast(agent, auditResult);
+    await broadcastToTelegram(broadcastMessage);
+
+    logger.info(
+      { wallet: agent.owner, verdict, auditId: auditResult.auditId, name: displayName },
+      'New Agent Watcher: audit complete'
+    );
+  }
 }
 
 // ─── Provider ─────────────────────────────────────────────────────────────────
@@ -348,12 +545,17 @@ const saidTrustProvider: Provider = {
       tier = 'API_UNREACHABLE';
     }
 
+    const watcherStatus = svc.watcherTimer
+      ? `Running (since ${svc.watcherStartedAt?.toUTCString() ?? 'unknown'}, tracking ${svc.knownAgentWallets.size} agents)`
+      : 'Stopped';
+
     return {
       text: [
         'Said Sentinel Identity:',
         `- Public Key: ${svc.keypair.publicKey.toString()}`,
         `- SOL Balance: ${balance.toFixed(4)} SOL`,
         `- Trust Tier: ${tier}`,
+        `- New Agent Watcher: ${watcherStatus}`,
       ].join('\n'),
       values: { balance, tier, pubkey: svc.keypair.publicKey.toString() },
       data: {},
@@ -361,7 +563,7 @@ const saidTrustProvider: Provider = {
   },
 };
 
-// ─── Action ───────────────────────────────────────────────────────────────────
+// ─── Action: PERFORM_SAID_AUDIT ───────────────────────────────────────────────
 const performSaidAuditAction: Action = {
   name: 'PERFORM_SAID_AUDIT',
   similes: ['AUDIT', 'VERIFY_IDENTITY', 'CHECK_TRANSACTION', 'INSPECT_AGENT', 'SAID_AUDIT'],
@@ -489,6 +691,158 @@ const performSaidAuditAction: Action = {
   ],
 };
 
+// ─── Action: LIST_AGENTS ──────────────────────────────────────────────────────
+const listAgentsAction: Action = {
+  name: 'LIST_AGENTS',
+  similes: ['LIST_SAID_AGENTS', 'SHOW_AGENTS', 'GET_AGENTS', 'AGENT_REGISTRY', 'AGENT_STATS'],
+  description:
+    'Lists all agents registered on the Said Protocol with verification status, stats, and watcher state.',
+
+  validate: async (_runtime: IAgentRuntime, message: Memory): Promise<boolean> => {
+    return /list.*agents?|show.*agents?|how many agents?|agent.*registry|all agents?|agent.*stats?|registry/i.test(
+      message.content.text ?? ''
+    );
+  },
+
+  handler: async (
+    runtime: IAgentRuntime,
+    _message: Memory,
+    _state: State,
+    _options: unknown,
+    callback: HandlerCallback
+  ): Promise<ActionResult> => {
+    const svc = runtime.getService<SaidSentinelService>(SaidSentinelService.serviceType);
+    if (!svc) {
+      await callback({ text: 'Said Sentinel service not available.', actions: [] });
+      return { success: false, text: 'Service unavailable' };
+    }
+
+    let agents: AgentIdentity[] = [];
+    let stats = { total: 0, verified: 0 };
+
+    try {
+      [agents, stats] = await Promise.all([
+        svc.saidClient.listAgents({ includeCards: true }),
+        svc.saidClient.getStats(),
+      ]);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await callback({
+        text: `Failed to fetch agent registry: ${errMsg}`,
+        actions: [],
+      });
+      return { success: false, text: 'Failed to fetch agents' };
+    }
+
+    const verifiedPct =
+      stats.total > 0 ? ((stats.verified / stats.total) * 100).toFixed(0) : '0';
+
+    // Sort by most recently registered
+    const sorted = [...agents].sort((a, b) => b.registeredAt - a.registeredAt);
+    const recentAgents = sorted.slice(0, 10);
+
+    const lines: string[] = [
+      `**Said Protocol Agent Registry**`,
+      `Total Registered: **${stats.total}** | Verified: **${stats.verified}** (${verifiedPct}%)`,
+      `Watcher Tracking: **${svc.knownAgentWallets.size}** agents`,
+      ``,
+      `**10 Most Recent Agents:**`,
+      ...recentAgents.map((a, i) => {
+        const name = a.card?.name ?? `${a.owner.slice(0, 8)}...`;
+        const badge = a.isVerified ? '✅' : '⬜';
+        const date = new Date(a.registeredAt * 1000).toLocaleDateString();
+        const twitter = a.card?.twitter ? ` (@${a.card.twitter})` : '';
+        return `${i + 1}. ${badge} **${name}**${twitter} \`${a.owner.slice(0, 10)}...\` _(${date})_`;
+      }),
+    ];
+
+    const text = lines.join('\n');
+    await callback({ text, actions: ['LIST_AGENTS'] });
+
+    return {
+      success: true,
+      text: `Found ${stats.total} agents (${stats.verified} verified)`,
+      values: { total: stats.total, verified: stats.verified },
+      data: { agents: recentAgents, stats },
+    };
+  },
+
+  examples: [
+    [
+      { name: '{{name1}}', content: { text: 'List all registered agents on Said Protocol' } },
+      {
+        name: 'Said Sentinel',
+        content: {
+          text: '**Said Protocol Agent Registry**\nTotal Registered: **42** | Verified: **15** (36%)...',
+          actions: ['LIST_AGENTS'],
+        },
+      },
+    ],
+  ],
+};
+
+// ─── Action: WATCHER_STATUS ───────────────────────────────────────────────────
+const watcherStatusAction: Action = {
+  name: 'WATCHER_STATUS',
+  similes: ['WATCHER_INFO', 'MONITORING_STATUS', 'CHECK_WATCHER'],
+  description: 'Reports the current status of the autonomous New Agent Watcher.',
+
+  validate: async (_runtime: IAgentRuntime, message: Memory): Promise<boolean> => {
+    return /watcher|monitoring|watching|auto.?audit|new agent.*watch/i.test(
+      message.content.text ?? ''
+    );
+  },
+
+  handler: async (
+    runtime: IAgentRuntime,
+    _message: Memory,
+    _state: State,
+    _options: unknown,
+    callback: HandlerCallback
+  ): Promise<ActionResult> => {
+    const svc = runtime.getService<SaidSentinelService>(SaidSentinelService.serviceType);
+    if (!svc) {
+      await callback({ text: 'Said Sentinel service not available.', actions: [] });
+      return { success: false, text: 'Service unavailable' };
+    }
+
+    const isRunning = svc.watcherTimer !== null;
+    const statusEmoji = isRunning ? '🟢' : '🔴';
+    const channelConfigured = Boolean(TELEGRAM_AUDIT_CHANNEL);
+
+    const lines = [
+      `**New Agent Watcher Status**`,
+      `${statusEmoji} Status: ${isRunning ? 'Running' : 'Stopped'}`,
+      `Started: ${svc.watcherStartedAt?.toUTCString() ?? 'N/A'}`,
+      `Poll Interval: ${WATCHER_POLL_MS / 60000} minutes`,
+      `Agents Tracked: ${svc.knownAgentWallets.size}`,
+      `Telegram Broadcast: ${channelConfigured ? `✅ Channel configured` : '⚠️ TELEGRAM_AUDIT_CHANNEL_ID not set'}`,
+    ];
+
+    await callback({ text: lines.join('\n'), actions: ['WATCHER_STATUS'] });
+
+    return {
+      success: true,
+      text: `Watcher is ${isRunning ? 'running' : 'stopped'}, tracking ${svc.knownAgentWallets.size} agents`,
+      values: { isRunning, trackedCount: svc.knownAgentWallets.size },
+      data: {},
+    };
+  },
+
+  examples: [
+    [
+      { name: '{{name1}}', content: { text: 'What is the watcher status?' } },
+      {
+        name: 'Said Sentinel',
+        content: {
+          text: '**New Agent Watcher Status**\n🟢 Status: Running...',
+          actions: ['WATCHER_STATUS'],
+        },
+      },
+    ],
+  ],
+};
+
 // ─── Evaluator ────────────────────────────────────────────────────────────────
 const auditOpportunityEvaluator: Evaluator = {
   name: 'AUDIT_OPPORTUNITY_EVALUATOR',
@@ -519,7 +873,7 @@ const auditOpportunityEvaluator: Evaluator = {
 const saidPlugin: Plugin = {
   name: 'said-sentinel-plugin',
   description:
-    'Said Protocol audit plugin — verifies on-chain identity PDAs, transactions, and A2A message envelopes. Produces cryptographically signed SAID_v1 audit reports.',
+    'Said Protocol audit plugin — verifies on-chain identity PDAs, transactions, and A2A message envelopes. Autonomously watches for new agent registrations and broadcasts signed SAID_v1 audit reports.',
   priority: 100,
   config: {
     SOLANA_PRIVATE_KEY: process.env.SOLANA_PRIVATE_KEY,
@@ -543,7 +897,7 @@ const saidPlugin: Plugin = {
     }
   },
   services: [SaidSentinelService],
-  actions: [performSaidAuditAction],
+  actions: [performSaidAuditAction, listAgentsAction, watcherStatusAction],
   providers: [saidTrustProvider],
   evaluators: [auditOpportunityEvaluator],
 };
