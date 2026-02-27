@@ -535,6 +535,10 @@ export class SaidSentinelService extends Service {
   driftHistory: Map<string, DriftRecord[]> = new Map();
   driftSeverityCache: Map<string, DriftSeverity> = new Map(); // last known severity per agent
 
+  // Daily Digest state
+  digestTimer: ReturnType<typeof setTimeout> | null = null;
+  digestLastSent: Date | null = null;
+
   constructor(runtime: IAgentRuntime) {
     super(runtime);
   }
@@ -553,6 +557,7 @@ export class SaidSentinelService extends Service {
     // Start autonomous background services
     await svc.startWatcher();
     svc.startReauditor();
+    svc.startDailyDigest();
 
     return svc;
   }
@@ -564,6 +569,7 @@ export class SaidSentinelService extends Service {
   async stop(): Promise<void> {
     this.stopWatcher();
     this.stopReauditor();
+    this.stopDailyDigest();
   }
 
   // ─── Reputation Drift Monitor ─────────────────────────────────────────────
@@ -670,6 +676,101 @@ export class SaidSentinelService extends Service {
       this.reauditorTimer = null;
       logger.info('Continuous Re-Auditor: stopped');
     }
+  }
+
+  // ─── Daily Digest ──────────────────────────────────────────────────────────
+  startDailyDigest(): void {
+    const msUntil9amUTC = (): number => {
+      const now = new Date();
+      const next = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 9, 0, 0, 0)
+      );
+      if (next.getTime() <= now.getTime()) next.setUTCDate(next.getUTCDate() + 1);
+      return next.getTime() - now.getTime();
+    };
+
+    const schedule = (): void => {
+      const delay = msUntil9amUTC();
+      logger.info({ nextDigestIn: `${(delay / 3600000).toFixed(2)}h` }, 'Daily Digest: scheduled');
+      this.digestTimer = setTimeout(() => {
+        void this.sendDailyDigest().then(() => schedule());
+      }, delay);
+    };
+
+    schedule();
+  }
+
+  stopDailyDigest(): void {
+    if (this.digestTimer) {
+      clearTimeout(this.digestTimer);
+      this.digestTimer = null;
+      logger.info('Daily Digest: stopped');
+    }
+  }
+
+  async sendDailyDigest(): Promise<void> {
+    logger.info('Daily Digest: building...');
+    this.digestLastSent = new Date();
+
+    // Registry stats
+    let total = 0;
+    let verified = 0;
+    try {
+      const stats = await this.saidClient.getStats();
+      total = stats.total;
+      verified = stats.verified;
+    } catch {
+      // non-fatal — proceed with cached counts
+    }
+
+    // Re-audit summary
+    const cycleStats = this.reauditorLastCycleStats;
+    const lastRunStr = this.reauditorLastRun?.toUTCString() ?? 'Not yet run';
+
+    // Top at-risk agents (SEVERE first, then MODERATE, then by score drop)
+    const atRisk = Array.from(this.driftHistory.entries())
+      .filter(([, records]) => records.length > 0)
+      .map(([wallet, records]) => computeDriftAnalysis(wallet, records))
+      .filter((a) => severityRank(a.severity) >= severityRank('MODERATE'))
+      .sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || b.scoreDrop - a.scoreDrop)
+      .slice(0, 3);
+
+    const severityIcon: Record<DriftSeverity, string> = {
+      NONE: '✅',
+      MILD: '🟡',
+      MODERATE: '🟠',
+      SEVERE: '🔴',
+    };
+
+    const atRiskLines =
+      atRisk.length > 0
+        ? atRisk.map(
+            (a) =>
+              `  ${severityIcon[a.severity]} \`${a.wallet.slice(0, 8)}…\` — ${a.severity} (−${(a.scoreDrop * 100).toFixed(0)}pts over ${a.recordCount} audits)`
+          )
+        : ['  ✅ No high-risk agents detected'];
+
+    const lines = [
+      `📋 **Said Sentinel — Daily Digest**`,
+      `${new Date().toUTCString()}`,
+      ``,
+      `**Registry**`,
+      `• Total agents: **${total}** | Verified: **${verified}**`,
+      `• Watcher tracking: **${this.knownAgentWallets.size}** wallets`,
+      ``,
+      `**Re-Audit Summary**`,
+      `• Last cycle: ${lastRunStr}`,
+      cycleStats
+        ? `• Audited: **${cycleStats.audited}** | Alerts fired: **${cycleStats.alerts}**`
+        : `• No cycle completed yet`,
+      `• Coverage: ${this.auditHistory.size}/${this.knownAgentWallets.size} agents in history`,
+      ``,
+      `**Top At-Risk Agents**`,
+      ...atRiskLines,
+    ];
+
+    await broadcastToTelegram(lines.join('\n'));
+    logger.info('Daily Digest: sent');
   }
 
   async runReauditCycle(force = false): Promise<{ audited: number; alerts: number }> {
@@ -1002,19 +1103,11 @@ const performSaidAuditAction: Action = {
       },
     };
 
-    const findingSummary =
-      findings.length > 0
-        ? `\nFindings:\n${findings.map((f) => `• [${f.severity}] ${f.issue}`).join('\n')}`
-        : '\nNo issues found.';
-
-    const responseText = [
-      `**Said Sentinel Audit Report**`,
-      `Type: ${auditType} | Verdict: **${verdict}** | Confidence: ${(confidenceScore * 100).toFixed(0)}%`,
-      findingSummary,
-      `\n\`\`\`json\n${JSON.stringify(auditResult, null, 2)}\n\`\`\``,
-    ].join('\n');
-
-    await callback({ text: responseText, actions: ['PERFORM_SAID_AUDIT'] });
+    // Compact signed receipt — the LLM's own response is the primary user-facing message.
+    await callback({
+      text: `_Signed receipt — ID: \`${auditResult.auditId.slice(0, 8)}\` | ${verdict} | Auditor: \`${svc.keypair.publicKey.toString().slice(0, 8)}…\` | Sig: \`${signature.slice(0, 16)}…\`_`,
+      actions: ['PERFORM_SAID_AUDIT'],
+    });
 
     return {
       success: true,
