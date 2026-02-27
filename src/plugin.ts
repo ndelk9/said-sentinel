@@ -431,6 +431,7 @@ export class SaidSentinelService extends Service {
   reauditorLastRun: Date | null = null;
   reauditorNextRun: Date | null = null;
   reauditorLastCycleStats: { audited: number; alerts: number } | null = null;
+  reauditorOffset = 0; // rotating cursor — advances each cycle so all agents are covered
 
   constructor(runtime: IAgentRuntime) {
     super(runtime);
@@ -532,9 +533,26 @@ export class SaidSentinelService extends Service {
     this.reauditorLastRun = new Date();
     this.reauditorNextRun = new Date(Date.now() + REAUDIT_INTERVAL_MS);
 
-    const wallets = Array.from(this.knownAgentWallets).slice(0, REAUDIT_BATCH_SIZE);
+    const all = Array.from(this.knownAgentWallets);
+    const total = all.length;
+    let wallets: string[];
+
+    if (total <= REAUDIT_BATCH_SIZE) {
+      // Fewer agents than batch size — audit all of them
+      wallets = all;
+      this.reauditorOffset = 0;
+    } else {
+      // Rotate: take BATCH_SIZE starting from offset, wrapping around
+      const start = this.reauditorOffset % total;
+      const end = start + REAUDIT_BATCH_SIZE;
+      wallets = end <= total
+        ? all.slice(start, end)
+        : [...all.slice(start), ...all.slice(0, end - total)];
+      this.reauditorOffset = end % total;
+    }
+
     logger.info(
-      { total: this.knownAgentWallets.size, auditing: wallets.length },
+      { total, auditing: wallets.length, offset: this.reauditorOffset },
       'Continuous Re-Auditor: cycle started'
     );
 
@@ -1001,7 +1019,7 @@ const watcherStatusAction: Action = {
       `Last run: ${svc.reauditorLastRun?.toUTCString() ?? 'Not yet run'}`,
       `Next run: ${svc.reauditorNextRun?.toUTCString() ?? 'N/A'}`,
       `Last cycle: ${svc.reauditorLastCycleStats ? `${svc.reauditorLastCycleStats.audited} audited, ${svc.reauditorLastCycleStats.alerts} alerts` : 'N/A'}`,
-      `History entries: ${svc.auditHistory.size}`,
+      `Coverage: ${svc.auditHistory.size}/${svc.knownAgentWallets.size} agents audited | next offset: ${svc.reauditorOffset}`,
       ``,
       `**Broadcast**`,
       `${channelConfigured ? '✅ Telegram channel configured' : '⚠️ TELEGRAM_AUDIT_CHANNEL_ID not set'}`,
