@@ -16,7 +16,7 @@ Package manager: **`bun`** (required — never use npm or yarn).
 | `src/character.ts` | Agent personality, plugin composition (env-gated plugins) |
 | `src/frontend/` | React/Vite public dashboard |
 | `src/index.ts` | Entry point and exports |
-| `build.ts` | Custom build script (used by `bun run build`) |
+| `build.ts` | Compiles TypeScript and builds the Vite frontend; invoked by `bun run build` |
 | `fly.toml` | fly.io deployment config |
 
 ---
@@ -27,9 +27,9 @@ Package manager: **`bun`** (required — never use npm or yarn).
 bun dev              # Start with hot reload (recommended for development)
 bun start            # Start without hot reload (requires bun run build first)
 bun run build        # Build (runs build.ts)
-bun test             # Run component tests
+bun test             # Install test deps, then run component + e2e tests (slow)
 bun run type-check   # TypeScript check
-bun run lint         # Format with Prettier
+bun run lint         # Reformat src/ with Prettier (modifies files; use format:check to only check)
 fly deploy           # Deploy to fly.io
 ```
 
