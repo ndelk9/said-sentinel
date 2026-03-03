@@ -28,9 +28,23 @@ const WATCHER_POLL_MS = parseInt(process.env.WATCHER_POLL_INTERVAL_MS ?? '300000
 const PASSPORT_PROGRAM_ID = 'L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95';
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const STALENESS_THRESHOLD_DAYS = 90;
-const REAUDIT_INTERVAL_MS = parseInt(process.env.REAUDIT_INTERVAL_MS ?? '21600000', 10); // 6 hours
-const REAUDIT_BATCH_SIZE = parseInt(process.env.REAUDIT_BATCH_SIZE ?? '20', 10);
-const REAUDIT_DELAY_MS = parseInt(process.env.REAUDIT_DELAY_MS ?? '1000', 10); // 1s between agents
+// ── Re-Auditor (tiered micro-cycle) ──────────────────────────────────────────
+const REAUDIT_CYCLE_INTERVAL_MS = parseInt(process.env.REAUDIT_CYCLE_INTERVAL_MS ?? '600000', 10); // 10 min
+const REAUDIT_AGENTS_PER_CYCLE = parseInt(process.env.REAUDIT_AGENTS_PER_CYCLE ?? '8', 10);
+const REAUDIT_AGENT_DELAY_MS = parseInt(process.env.REAUDIT_AGENT_DELAY_MS ?? '15000', 10); // 15s between agents
+const REAUDIT_TIER_HOT_MS = parseInt(process.env.REAUDIT_TIER_HOT_MS ?? '7200000', 10);    // 2h
+const REAUDIT_TIER_WARM_MS = parseInt(process.env.REAUDIT_TIER_WARM_MS ?? '43200000', 10);  // 12h
+const REAUDIT_TIER_COOL_MS = parseInt(process.env.REAUDIT_TIER_COOL_MS ?? '172800000', 10); // 48h
+
+// ── Watcher backpressure ─────────────────────────────────────────────────────
+const WATCHER_BATCH_CAP = parseInt(process.env.WATCHER_BATCH_CAP ?? '10', 10);
+const WATCHER_AGENT_DELAY_MS = parseInt(process.env.WATCHER_AGENT_DELAY_MS ?? '15000', 10); // 15s
+
+// ── Deprecation warnings for old env vars ────────────────────────────────────
+for (const v of ['REAUDIT_INTERVAL_MS', 'REAUDIT_BATCH_SIZE', 'REAUDIT_DELAY_MS']) {
+  if (process.env[v]) logger.warn(`Env var ${v} is deprecated and ignored. See docs/plans/2026-03-02-reauditor-scaling-design.md for new config.`);
+}
+
 
 // ─── Config Schema ────────────────────────────────────────────────────────────
 const configSchema = z.object({
@@ -91,10 +105,43 @@ interface DriftAnalysis {
   severity: DriftSeverity;
 }
 
+type AgentTier = 'HOT' | 'WARM' | 'COOL';
+
+interface AgentMeta {
+  tier: AgentTier;
+  lastAuditedAt: string | null;
+  nextDueAt: string;
+  consecutivePasses: number;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+const TIER_INTERVAL: Record<AgentTier, number> = {
+  HOT: REAUDIT_TIER_HOT_MS,
+  WARM: REAUDIT_TIER_WARM_MS,
+  COOL: REAUDIT_TIER_COOL_MS,
+};
+
+const TIER_RANK: Record<AgentTier, number> = { HOT: 2, WARM: 1, COOL: 0 };
+
+function classifyTier(
+  verdict: AuditVerdict,
+  driftSeverity: DriftSeverity,
+  consecutivePasses: number
+): AgentTier {
+  if (verdict === 'FAIL' || verdict === 'WARNING') return 'HOT';
+  if (driftSeverity === 'SEVERE' || driftSeverity === 'MODERATE') return 'HOT';
+  if (consecutivePasses < 2) return 'WARM';
+  return 'COOL';
+}
+
+function computeNextDueAt(tier: AgentTier): string {
+  return new Date(Date.now() + TIER_INTERVAL[tier]).toISOString();
+}
+
 function isTxSignature(str: string): boolean {
   return /^[1-9A-HJ-NP-Za-km-z]{87,88}$/.test(str.trim());
 }
@@ -622,14 +669,15 @@ export class SaidSentinelService extends Service {
   watcherTimer: ReturnType<typeof setInterval> | null = null;
   watcherStartedAt: Date | null = null;
 
-  // Re-Auditor state
+  // Re-Auditor state (tiered priority queue)
   auditHistory: Map<string, AuditSnapshot> = new Map();
+  agentMeta: Map<string, AgentMeta> = new Map();
   reauditorTimer: ReturnType<typeof setInterval> | null = null;
   reauditorRunning = false;
   reauditorLastRun: Date | null = null;
-  reauditorNextRun: Date | null = null;
   reauditorLastCycleStats: { audited: number; alerts: number } | null = null;
-  reauditorOffset = 0; // rotating cursor — advances each cycle so all agents are covered
+  reauditorTotalAuditsToday = 0;
+  reauditorDayStart: Date = new Date();
 
   // Reputation Drift Monitor state
   driftHistory: Map<string, DriftRecord[]> = new Map();
@@ -676,10 +724,34 @@ export class SaidSentinelService extends Service {
   async loadDriftHistory(): Promise<void> {
     try {
       const raw = await readFile(DRIFT_HISTORY_FILE, 'utf-8');
-      const parsed = JSON.parse(raw) as Record<string, DriftRecord[]>;
-      this.driftHistory = new Map(Object.entries(parsed));
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
 
-      // Restore auditHistory from the latest record so the re-auditor has context
+      for (const [wallet, value] of Object.entries(parsed)) {
+        // Migrate old format: array of DriftRecords → new structured format
+        if (Array.isArray(value)) {
+          // Old format: { "wallet": [DriftRecord, ...] }
+          const records = value as DriftRecord[];
+          this.driftHistory.set(wallet, records);
+          this.agentMeta.set(wallet, {
+            tier: 'WARM',
+            lastAuditedAt: records.length > 0 ? records[records.length - 1].timestamp : null,
+            nextDueAt: new Date().toISOString(), // audit promptly
+            consecutivePasses: 0,
+          });
+        } else if (value && typeof value === 'object' && 'driftRecords' in value) {
+          // New format: { "wallet": { driftRecords, tier, ... } }
+          const entry = value as { driftRecords: DriftRecord[]; tier: AgentTier; lastAuditedAt: string | null; nextDueAt: string; consecutivePasses: number };
+          this.driftHistory.set(wallet, entry.driftRecords);
+          this.agentMeta.set(wallet, {
+            tier: entry.tier,
+            lastAuditedAt: entry.lastAuditedAt,
+            nextDueAt: entry.nextDueAt,
+            consecutivePasses: entry.consecutivePasses,
+          });
+        }
+      }
+
+      // Restore auditHistory and driftSeverityCache from latest records
       for (const [wallet, records] of this.driftHistory) {
         if (records.length > 0) {
           const latest = records[records.length - 1];
@@ -688,8 +760,9 @@ export class SaidSentinelService extends Service {
           this.driftSeverityCache.set(wallet, analysis.severity);
         }
       }
+
       logger.info(
-        { wallets: this.driftHistory.size },
+        { wallets: this.driftHistory.size, migrated: [...this.agentMeta.values()].filter(m => m.tier === 'WARM' && m.consecutivePasses === 0).length },
         'Drift history loaded from disk'
       );
     } catch {
@@ -700,7 +773,11 @@ export class SaidSentinelService extends Service {
   async saveDriftHistory(): Promise<void> {
     try {
       await mkdir('/app/data', { recursive: true });
-      const obj = Object.fromEntries(this.driftHistory);
+      const obj: Record<string, { driftRecords: DriftRecord[]; tier: AgentTier; lastAuditedAt: string | null; nextDueAt: string; consecutivePasses: number }> = {};
+      for (const [wallet, records] of this.driftHistory) {
+        const meta = this.agentMeta.get(wallet) ?? { tier: 'WARM' as AgentTier, lastAuditedAt: null, nextDueAt: new Date().toISOString(), consecutivePasses: 0 };
+        obj[wallet] = { driftRecords: records, ...meta };
+      }
       await writeFile(DRIFT_HISTORY_FILE, JSON.stringify(obj));
     } catch (err) {
       logger.warn({ err }, 'Failed to save drift history');
@@ -753,20 +830,22 @@ export class SaidSentinelService extends Service {
     }
   }
 
-  // ─── Continuous Re-Auditor ─────────────────────────────────────────────────
+  // ─── Tiered Re-Auditor ──────────────────────────────────────────────────────
   startReauditor(): void {
-    this.reauditorNextRun = new Date(Date.now() + REAUDIT_INTERVAL_MS);
     this.reauditorTimer = setInterval(() => {
-      void this.runReauditCycle();
-    }, REAUDIT_INTERVAL_MS);
+      void this.runMicroCycle();
+    }, REAUDIT_CYCLE_INTERVAL_MS);
+
     logger.info(
       {
-        intervalHours: (REAUDIT_INTERVAL_MS / 3600000).toFixed(1),
-        batchSize: REAUDIT_BATCH_SIZE,
-        delayMs: REAUDIT_DELAY_MS,
-        firstRunAt: this.reauditorNextRun.toUTCString(),
+        cycleIntervalMin: (REAUDIT_CYCLE_INTERVAL_MS / 60000).toFixed(1),
+        agentsPerCycle: REAUDIT_AGENTS_PER_CYCLE,
+        delayMs: REAUDIT_AGENT_DELAY_MS,
+        tierHotH: (REAUDIT_TIER_HOT_MS / 3600000).toFixed(1),
+        tierWarmH: (REAUDIT_TIER_WARM_MS / 3600000).toFixed(1),
+        tierCoolH: (REAUDIT_TIER_COOL_MS / 3600000).toFixed(1),
       },
-      'Continuous Re-Auditor: scheduled'
+      'Tiered Re-Auditor: started'
     );
   }
 
@@ -774,8 +853,47 @@ export class SaidSentinelService extends Service {
     if (this.reauditorTimer) {
       clearInterval(this.reauditorTimer);
       this.reauditorTimer = null;
-      logger.info('Continuous Re-Auditor: stopped');
+      logger.info('Tiered Re-Auditor: stopped');
     }
+  }
+
+  ensureAgentMeta(wallet: string): AgentMeta {
+    let meta = this.agentMeta.get(wallet);
+    if (!meta) {
+      meta = {
+        tier: 'WARM',
+        lastAuditedAt: null,
+        nextDueAt: new Date().toISOString(), // due immediately
+        consecutivePasses: 0,
+      };
+      this.agentMeta.set(wallet, meta);
+    }
+    return meta;
+  }
+
+  selectNextBatch(limit: number): string[] {
+    const now = Date.now();
+
+    // Build urgency-scored list from all known agents
+    const scored: { wallet: string; urgency: number; tierRank: number }[] = [];
+    for (const wallet of this.knownAgentWallets) {
+      const meta = this.ensureAgentMeta(wallet);
+      const dueAt = new Date(meta.nextDueAt).getTime();
+      const urgency = now - dueAt; // positive = overdue
+      scored.push({ wallet, urgency, tierRank: TIER_RANK[meta.tier] });
+    }
+
+    // Sort: most overdue first, then by tier rank (HOT > WARM > COOL)
+    scored.sort((a, b) => {
+      if (b.urgency !== a.urgency) return b.urgency - a.urgency;
+      return b.tierRank - a.tierRank;
+    });
+
+    // Only pick agents that are actually due (urgency > 0)
+    return scored
+      .filter((s) => s.urgency > 0)
+      .slice(0, limit)
+      .map((s) => s.wallet);
   }
 
   // ─── Daily Digest ──────────────────────────────────────────────────────────
@@ -867,51 +985,48 @@ export class SaidSentinelService extends Service {
       ``,
       `**Top At-Risk Agents**`,
       ...atRiskLines,
+      ``,
+      `**Tier Distribution**`,
     ];
+
+    // Tier distribution
+    const tierCounts = { HOT: 0, WARM: 0, COOL: 0 };
+    for (const meta of this.agentMeta.values()) tierCounts[meta.tier]++;
+    lines.push(`Tiers: 🔴 HOT ${tierCounts.HOT} · 🟡 WARM ${tierCounts.WARM} · 🟢 COOL ${tierCounts.COOL}`);
+    lines.push(`Audits (24h): ${this.reauditorTotalAuditsToday}`);
 
     await broadcastToTelegram(lines.join('\n'));
 
     logger.info('Daily Digest: sent');
   }
 
-  async runReauditCycle(force = false): Promise<{ audited: number; alerts: number }> {
-    if (this.reauditorRunning && !force) {
-      logger.warn('Continuous Re-Auditor: previous cycle still running, skipping');
+  async runMicroCycle(): Promise<{ audited: number; alerts: number }> {
+    if (this.reauditorRunning) {
+      logger.debug('Tiered Re-Auditor: previous micro-cycle still running, skipping');
+      return { audited: 0, alerts: 0 };
+    }
+
+    // Reset daily counter at midnight
+    const today = new Date();
+    if (today.toISOString().slice(0, 10) !== this.reauditorDayStart.toISOString().slice(0, 10)) {
+      this.reauditorTotalAuditsToday = 0;
+      this.reauditorDayStart = today;
+    }
+
+    const batch = this.selectNextBatch(REAUDIT_AGENTS_PER_CYCLE);
+    if (batch.length === 0) {
+      logger.debug('Tiered Re-Auditor: no agents due, skipping cycle');
       return { audited: 0, alerts: 0 };
     }
 
     this.reauditorRunning = true;
     this.reauditorLastRun = new Date();
-    this.reauditorNextRun = new Date(Date.now() + REAUDIT_INTERVAL_MS);
-
-    const all = Array.from(this.knownAgentWallets);
-    const total = all.length;
-    let wallets: string[];
-
-    if (total <= REAUDIT_BATCH_SIZE) {
-      // Fewer agents than batch size — audit all of them
-      wallets = all;
-      this.reauditorOffset = 0;
-    } else {
-      // Rotate: take BATCH_SIZE starting from offset, wrapping around
-      const start = this.reauditorOffset % total;
-      const end = start + REAUDIT_BATCH_SIZE;
-      wallets = end <= total
-        ? all.slice(start, end)
-        : [...all.slice(start), ...all.slice(0, end - total)];
-      this.reauditorOffset = end % total;
-    }
-
-    logger.info(
-      { total, auditing: wallets.length, offset: this.reauditorOffset },
-      'Continuous Re-Auditor: cycle started'
-    );
 
     let audited = 0;
     let alerts = 0;
 
     try {
-      for (const wallet of wallets) {
+      for (const wallet of batch) {
         try {
           const { findings, confidenceScore } = await auditIdentityPDA(wallet, this.saidClient, this.connection);
           const verdict = deriveVerdict(findings, confidenceScore);
@@ -938,15 +1053,11 @@ export class SaidSentinelService extends Service {
           if (severityRank(driftAnalysis.severity) > severityRank(prevSeverity)) {
             this.driftSeverityCache.set(wallet, driftAnalysis.severity);
             await broadcastToTelegram(formatDriftAlert(driftAnalysis));
-            logger.info(
-              { wallet, prevSeverity, newSeverity: driftAnalysis.severity },
-              'Drift Monitor: severity worsened, alert broadcast'
-            );
           } else {
             this.driftSeverityCache.set(wallet, driftAnalysis.severity);
           }
 
-          // Broadcast only on verdict changes or first-time alerts — never spam unchanged PASSes
+          // Broadcast only on verdict changes or first-time alerts
           if (verdictChanged || isFirstAuditAlert) {
             const payload: Omit<SaidAuditResult, 'attestation'> = {
               protocol: 'SAID_v1',
@@ -962,34 +1073,39 @@ export class SaidSentinelService extends Service {
               ...payload,
               attestation: { auditor: this.keypair.publicKey.toString(), signature },
             };
-
             await broadcastToTelegram(formatReauditBroadcast(wallet, auditResult, prev));
             alerts++;
-
-            logger.info(
-              { wallet, prev: prev?.verdict ?? 'NEW', current: verdict },
-              'Continuous Re-Auditor: verdict change detected and broadcast'
-            );
           }
+
+          // Update tier metadata
+          const meta = this.ensureAgentMeta(wallet);
+          if (verdict === 'PASS') {
+            meta.consecutivePasses++;
+          } else {
+            meta.consecutivePasses = 0;
+          }
+          meta.tier = classifyTier(verdict, driftAnalysis.severity, meta.consecutivePasses);
+          meta.lastAuditedAt = snapshot.timestamp;
+          meta.nextDueAt = computeNextDueAt(meta.tier);
 
           audited++;
         } catch (err) {
-          logger.warn({ err, wallet }, 'Continuous Re-Auditor: audit failed for wallet, skipping');
+          logger.warn({ err, wallet }, 'Tiered Re-Auditor: audit failed for wallet, skipping');
         }
 
         // Rate limit: pause between each agent
-        await sleep(REAUDIT_DELAY_MS);
+        await sleep(REAUDIT_AGENT_DELAY_MS);
       }
     } finally {
       this.reauditorRunning = false;
       this.reauditorLastCycleStats = { audited, alerts };
-      // Persist drift history to disk after every cycle
+      this.reauditorTotalAuditsToday += audited;
       await this.saveDriftHistory();
     }
 
     logger.info(
-      { audited, alerts, skipped: wallets.length - audited },
-      'Continuous Re-Auditor: cycle complete'
+      { audited, alerts, totalToday: this.reauditorTotalAuditsToday },
+      'Tiered Re-Auditor: micro-cycle complete'
     );
 
     return { audited, alerts };
@@ -1021,10 +1137,32 @@ export class SaidSentinelService extends Service {
       'New Agent Watcher: new agents detected!'
     );
 
+    // Process up to WATCHER_BATCH_CAP agents this poll
+    const batch = newAgents.slice(0, WATCHER_BATCH_CAP);
+    const overflow = newAgents.slice(WATCHER_BATCH_CAP);
+
+    // Register ALL new agents immediately (prevents re-detection next poll)
     for (const agent of newAgents) {
-      // Register immediately so concurrent polls don't re-audit the same agent
       this.knownAgentWallets.add(agent.owner);
+    }
+
+    // Overflow agents: register as WARM in priority queue (no immediate audit)
+    if (overflow.length > 0) {
+      for (const agent of overflow) {
+        this.ensureAgentMeta(agent.owner); // defaults to WARM, nextDueAt = now
+      }
+      logger.info(
+        { overflow: overflow.length },
+        'New Agent Watcher: excess agents queued for priority re-auditor'
+      );
+    }
+
+    // Audit the capped batch with delay between each
+    for (const agent of batch) {
       await this.auditAndBroadcast(agent);
+      if (batch.indexOf(agent) < batch.length - 1) {
+        await sleep(WATCHER_AGENT_DELAY_MS);
+      }
     }
   }
 
@@ -1069,6 +1207,28 @@ export class SaidSentinelService extends Service {
 
     const broadcastMessage = formatAuditBroadcast(agent, auditResult);
     await broadcastToTelegram(broadcastMessage);
+
+    // Update audit history, drift records, and tier metadata so the priority
+    // queue doesn't immediately re-audit this agent
+    const snapshot: AuditSnapshot = {
+      verdict,
+      confidenceScore: Math.round(confidenceScore * 100) / 100,
+      timestamp: new Date().toISOString(),
+    };
+    this.auditHistory.set(agent.owner, snapshot);
+
+    const driftAnalysis = this.appendDriftRecord(agent.owner, snapshot);
+    this.driftSeverityCache.set(agent.owner, driftAnalysis.severity);
+
+    const meta = this.ensureAgentMeta(agent.owner);
+    if (verdict === 'PASS') {
+      meta.consecutivePasses++;
+    } else {
+      meta.consecutivePasses = 0;
+    }
+    meta.tier = classifyTier(verdict, driftAnalysis.severity, meta.consecutivePasses);
+    meta.lastAuditedAt = snapshot.timestamp;
+    meta.nextDueAt = computeNextDueAt(meta.tier);
 
     logger.info(
       { wallet: agent.owner, verdict, auditId: auditResult.auditId, name: displayName },
@@ -1367,6 +1527,9 @@ const watcherStatusAction: Action = {
     const watcherRunning = svc.watcherTimer !== null;
     const reauditorRunning = svc.reauditorTimer !== null;
 
+    const tierCounts = { HOT: 0, WARM: 0, COOL: 0 };
+    for (const meta of svc.agentMeta.values()) tierCounts[meta.tier]++;
+
     const lines = [
       `**Said Sentinel — Monitoring Status**`,
       ``,
@@ -1376,13 +1539,14 @@ const watcherStatusAction: Action = {
       `Poll interval: every ${WATCHER_POLL_MS / 60000} min`,
       `Agents tracked: ${svc.knownAgentWallets.size}`,
       ``,
-      `**Continuous Re-Auditor**`,
-      `${reauditorRunning ? '🟢' : '🔴'} ${reauditorRunning ? 'Scheduled' : 'Stopped'}${svc.reauditorRunning ? ' *(cycle in progress)*' : ''}`,
-      `Interval: every ${(REAUDIT_INTERVAL_MS / 3600000).toFixed(1)}h | Batch: ${REAUDIT_BATCH_SIZE} agents | Delay: ${REAUDIT_DELAY_MS}ms`,
-      `Last run: ${svc.reauditorLastRun?.toUTCString() ?? 'Not yet run'}`,
-      `Next run: ${svc.reauditorNextRun?.toUTCString() ?? 'N/A'}`,
+      `**Tiered Re-Auditor**`,
+      `${reauditorRunning ? '🟢' : '🔴'} ${reauditorRunning ? 'Running' : 'Stopped'}${svc.reauditorRunning ? ' *(micro-cycle in progress)*' : ''}`,
+      `Cycle: every ${(REAUDIT_CYCLE_INTERVAL_MS / 60000).toFixed(0)}min | ${REAUDIT_AGENTS_PER_CYCLE} agents/cycle | ${REAUDIT_AGENT_DELAY_MS / 1000}s delay`,
+      `Tiers: HOT=${(REAUDIT_TIER_HOT_MS / 3600000).toFixed(0)}h / WARM=${(REAUDIT_TIER_WARM_MS / 3600000).toFixed(0)}h / COOL=${(REAUDIT_TIER_COOL_MS / 3600000).toFixed(0)}h`,
+      `Last micro-cycle: ${svc.reauditorLastRun?.toUTCString() ?? 'Not yet run'}`,
       `Last cycle: ${svc.reauditorLastCycleStats ? `${svc.reauditorLastCycleStats.audited} audited, ${svc.reauditorLastCycleStats.alerts} alerts` : 'N/A'}`,
-      `Coverage: ${svc.auditHistory.size}/${svc.knownAgentWallets.size} agents audited | next offset: ${svc.reauditorOffset}`,
+      `Tier distribution: HOT=${tierCounts.HOT} / WARM=${tierCounts.WARM} / COOL=${tierCounts.COOL}`,
+      `Coverage: ${svc.auditHistory.size}/${svc.knownAgentWallets.size} agents audited | ${svc.reauditorTotalAuditsToday} audits today`,
       ``,
       `**Broadcast**`,
       `${channelConfigured ? '✅ Telegram channel configured' : '⚠️ TELEGRAM_AUDIT_CHANNEL_ID not set'}`,
@@ -1446,14 +1610,14 @@ const reauditNowAction: Action = {
       return { success: false, text: 'Cycle already running' };
     }
 
-    const total = Math.min(svc.knownAgentWallets.size, REAUDIT_BATCH_SIZE);
+    const total = Math.min(svc.knownAgentWallets.size, REAUDIT_AGENTS_PER_CYCLE);
     await callback({
-      text: `Starting re-audit cycle for up to **${total}** agents (${REAUDIT_DELAY_MS}ms between each). I'll report when done.`,
+      text: `Starting micro-cycle for up to **${total}** agents (${REAUDIT_AGENT_DELAY_MS / 1000}s between each). I'll report when done.`,
       actions: ['REAUDIT_NOW'],
     });
 
     // Run in background — don't await in handler
-    void svc.runReauditCycle(true).then(({ audited, alerts }) => {
+    void svc.runMicroCycle().then(({ audited, alerts }) => {
       logger.info({ audited, alerts }, 'REAUDIT_NOW: manual cycle complete');
     });
 
@@ -1720,8 +1884,15 @@ const saidPlugin: Plugin = {
             running: svc.reauditorTimer !== null,
             cycleInProgress: svc.reauditorRunning,
             lastRun: svc.reauditorLastRun?.toISOString() ?? null,
-            nextRun: svc.reauditorNextRun?.toISOString() ?? null,
             lastCycleStats: svc.reauditorLastCycleStats,
+            auditsToday: svc.reauditorTotalAuditsToday,
+            cycleIntervalMs: REAUDIT_CYCLE_INTERVAL_MS,
+            agentsPerCycle: REAUDIT_AGENTS_PER_CYCLE,
+            tierDistribution: (() => {
+              const counts = { HOT: 0, WARM: 0, COOL: 0 };
+              for (const meta of svc.agentMeta.values()) counts[meta.tier]++;
+              return counts;
+            })(),
             coverage: {
               audited: svc.auditHistory.size,
               total: svc.knownAgentWallets.size,
@@ -1877,10 +2048,13 @@ async function refresh(){
     document.getElementById('reauditor-dot').className='w-2 h-2 rounded-full '+(d.reauditor.running?'bg-emerald-500':'bg-red-500');
     document.getElementById('reauditor-details').innerHTML=lines([
       d.reauditor.running
-        ?'<span class="text-emerald-400">Scheduled</span>'+(d.reauditor.cycleInProgress?' <span class="text-yellow-400">(running)</span>':'')
+        ?'<span class="text-emerald-400">Running</span>'+(d.reauditor.cycleInProgress?' <span class="text-yellow-400">(micro-cycle)</span>':'')
         :'<span class="text-red-400">Stopped</span>',
       'Last run: '+ago(d.reauditor.lastRun),
-      'Next run: '+ago(d.reauditor.nextRun),
+      'Re-auditor: '+(d.reauditor.running?'running':'stopped')+
+      ' | '+d.reauditor.agentsPerCycle+'/cycle every '+Math.round(d.reauditor.cycleIntervalMs/60000)+'min'+
+      ' | '+d.reauditor.auditsToday+' audits today'+
+      ' | HOT:'+d.reauditor.tierDistribution.HOT+' WARM:'+d.reauditor.tierDistribution.WARM+' COOL:'+d.reauditor.tierDistribution.COOL,
       d.reauditor.lastCycleStats?'Last cycle: '+d.reauditor.lastCycleStats.audited+' audited, '+d.reauditor.lastCycleStats.alerts+' alerts':null,
       'Coverage: '+cov.audited+'/'+cov.total+' ('+pct+'%)',
     ]);
