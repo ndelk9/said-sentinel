@@ -59,9 +59,18 @@ OLLAMA_API_ENDPOINT=
 
 # Polling / batch tuning (optional, defaults shown)
 WATCHER_POLL_INTERVAL_MS=300000     # 5 min
-REAUDIT_INTERVAL_MS=21600000        # 6 hours
-REAUDIT_BATCH_SIZE=20
-REAUDIT_DELAY_MS=1000
+
+# Re-auditor (tiered micro-cycle scheduler)
+REAUDIT_CYCLE_INTERVAL_MS=600000    # 10 min between micro-cycles
+REAUDIT_AGENTS_PER_CYCLE=8          # Agents per micro-cycle
+REAUDIT_AGENT_DELAY_MS=15000        # 15s between agents (RPC rate limit)
+REAUDIT_TIER_HOT_MS=7200000         # 2h — FAIL/WARNING/high drift
+REAUDIT_TIER_WARM_MS=43200000       # 12h — new/unknown/moderate drift
+REAUDIT_TIER_COOL_MS=172800000      # 48h — stable PASS
+
+# Watcher backpressure
+WATCHER_BATCH_CAP=10                # Max new agents audited per poll
+WATCHER_AGENT_DELAY_MS=15000        # 15s between new agent audits
 ```
 
 ---
