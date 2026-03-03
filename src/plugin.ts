@@ -28,9 +28,27 @@ const WATCHER_POLL_MS = parseInt(process.env.WATCHER_POLL_INTERVAL_MS ?? '300000
 const PASSPORT_PROGRAM_ID = 'L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95';
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const STALENESS_THRESHOLD_DAYS = 90;
-const REAUDIT_INTERVAL_MS = parseInt(process.env.REAUDIT_INTERVAL_MS ?? '21600000', 10); // 6 hours
-const REAUDIT_BATCH_SIZE = parseInt(process.env.REAUDIT_BATCH_SIZE ?? '20', 10);
-const REAUDIT_DELAY_MS = parseInt(process.env.REAUDIT_DELAY_MS ?? '1000', 10); // 1s between agents
+// ── Re-Auditor (tiered micro-cycle) ──────────────────────────────────────────
+const REAUDIT_CYCLE_INTERVAL_MS = parseInt(process.env.REAUDIT_CYCLE_INTERVAL_MS ?? '600000', 10); // 10 min
+const REAUDIT_AGENTS_PER_CYCLE = parseInt(process.env.REAUDIT_AGENTS_PER_CYCLE ?? '8', 10);
+const REAUDIT_AGENT_DELAY_MS = parseInt(process.env.REAUDIT_AGENT_DELAY_MS ?? '15000', 10); // 15s between agents
+const REAUDIT_TIER_HOT_MS = parseInt(process.env.REAUDIT_TIER_HOT_MS ?? '7200000', 10);    // 2h
+const REAUDIT_TIER_WARM_MS = parseInt(process.env.REAUDIT_TIER_WARM_MS ?? '43200000', 10);  // 12h
+const REAUDIT_TIER_COOL_MS = parseInt(process.env.REAUDIT_TIER_COOL_MS ?? '172800000', 10); // 48h
+
+// ── Watcher backpressure ─────────────────────────────────────────────────────
+const WATCHER_BATCH_CAP = parseInt(process.env.WATCHER_BATCH_CAP ?? '10', 10);
+const WATCHER_AGENT_DELAY_MS = parseInt(process.env.WATCHER_AGENT_DELAY_MS ?? '15000', 10); // 15s
+
+// ── Deprecation warnings for old env vars ────────────────────────────────────
+for (const v of ['REAUDIT_INTERVAL_MS', 'REAUDIT_BATCH_SIZE', 'REAUDIT_DELAY_MS']) {
+  if (process.env[v]) logger.warn(`Env var ${v} is deprecated and ignored. See docs/plans/2026-03-02-reauditor-scaling-design.md for new config.`);
+}
+
+// ── Backward-compatible aliases (removed in later tasks) ─────────────────────
+const REAUDIT_INTERVAL_MS = REAUDIT_CYCLE_INTERVAL_MS;
+const REAUDIT_BATCH_SIZE = REAUDIT_AGENTS_PER_CYCLE;
+const REAUDIT_DELAY_MS = REAUDIT_AGENT_DELAY_MS;
 
 // ─── Config Schema ────────────────────────────────────────────────────────────
 const configSchema = z.object({
@@ -91,10 +109,43 @@ interface DriftAnalysis {
   severity: DriftSeverity;
 }
 
+type AgentTier = 'HOT' | 'WARM' | 'COOL';
+
+interface AgentMeta {
+  tier: AgentTier;
+  lastAuditedAt: string | null;
+  nextDueAt: string;
+  consecutivePasses: number;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+const TIER_INTERVAL: Record<AgentTier, number> = {
+  HOT: REAUDIT_TIER_HOT_MS,
+  WARM: REAUDIT_TIER_WARM_MS,
+  COOL: REAUDIT_TIER_COOL_MS,
+};
+
+const TIER_RANK: Record<AgentTier, number> = { HOT: 2, WARM: 1, COOL: 0 };
+
+function classifyTier(
+  verdict: AuditVerdict,
+  driftSeverity: DriftSeverity,
+  consecutivePasses: number
+): AgentTier {
+  if (verdict === 'FAIL' || verdict === 'WARNING') return 'HOT';
+  if (driftSeverity === 'SEVERE' || driftSeverity === 'MODERATE') return 'HOT';
+  if (consecutivePasses < 2) return 'WARM';
+  return 'COOL';
+}
+
+function computeNextDueAt(tier: AgentTier): string {
+  return new Date(Date.now() + TIER_INTERVAL[tier]).toISOString();
+}
+
 function isTxSignature(str: string): boolean {
   return /^[1-9A-HJ-NP-Za-km-z]{87,88}$/.test(str.trim());
 }
