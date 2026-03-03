@@ -1564,9 +1564,10 @@ export class SaidSentinelService extends Service {
           const driftAnalysis = this.appendDriftRecord(wallet, snapshot);
           const prevSeverity = this.driftSeverityCache.get(wallet) ?? "NONE";
 
-          // Broadcast drift alert if severity worsened
+          // Broadcast drift alert if severity worsened to MODERATE+
           if (
-            severityRank(driftAnalysis.severity) > severityRank(prevSeverity)
+            severityRank(driftAnalysis.severity) > severityRank(prevSeverity) &&
+            severityRank(driftAnalysis.severity) >= severityRank("MODERATE")
           ) {
             this.driftSeverityCache.set(wallet, driftAnalysis.severity);
             await broadcastToTelegram(formatDriftAlert(driftAnalysis));
