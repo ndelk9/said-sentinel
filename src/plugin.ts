@@ -1008,7 +1008,7 @@ export class SaidSentinelService extends Service {
 
     // Reset daily counter at midnight
     const today = new Date();
-    if (today.getUTCDate() !== this.reauditorDayStart.getUTCDate()) {
+    if (today.toISOString().slice(0, 10) !== this.reauditorDayStart.toISOString().slice(0, 10)) {
       this.reauditorTotalAuditsToday = 0;
       this.reauditorDayStart = today;
     }
@@ -1207,6 +1207,28 @@ export class SaidSentinelService extends Service {
 
     const broadcastMessage = formatAuditBroadcast(agent, auditResult);
     await broadcastToTelegram(broadcastMessage);
+
+    // Update audit history, drift records, and tier metadata so the priority
+    // queue doesn't immediately re-audit this agent
+    const snapshot: AuditSnapshot = {
+      verdict,
+      confidenceScore: Math.round(confidenceScore * 100) / 100,
+      timestamp: new Date().toISOString(),
+    };
+    this.auditHistory.set(agent.owner, snapshot);
+
+    const driftAnalysis = this.appendDriftRecord(agent.owner, snapshot);
+    this.driftSeverityCache.set(agent.owner, driftAnalysis.severity);
+
+    const meta = this.ensureAgentMeta(agent.owner);
+    if (verdict === 'PASS') {
+      meta.consecutivePasses++;
+    } else {
+      meta.consecutivePasses = 0;
+    }
+    meta.tier = classifyTier(verdict, driftAnalysis.severity, meta.consecutivePasses);
+    meta.lastAuditedAt = snapshot.timestamp;
+    meta.nextDueAt = computeNextDueAt(meta.tier);
 
     logger.info(
       { wallet: agent.owner, verdict, auditId: auditResult.auditId, name: displayName },
