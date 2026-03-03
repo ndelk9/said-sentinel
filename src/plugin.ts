@@ -985,7 +985,15 @@ export class SaidSentinelService extends Service {
       ``,
       `**Top At-Risk Agents**`,
       ...atRiskLines,
+      ``,
+      `**Tier Distribution**`,
     ];
+
+    // Tier distribution
+    const tierCounts = { HOT: 0, WARM: 0, COOL: 0 };
+    for (const meta of this.agentMeta.values()) tierCounts[meta.tier]++;
+    lines.push(`Tiers: 🔴 HOT ${tierCounts.HOT} · 🟡 WARM ${tierCounts.WARM} · 🟢 COOL ${tierCounts.COOL}`);
+    lines.push(`Audits (24h): ${this.reauditorTotalAuditsToday}`);
 
     await broadcastToTelegram(lines.join('\n'));
 
