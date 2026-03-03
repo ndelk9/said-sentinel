@@ -728,10 +728,34 @@ export class SaidSentinelService extends Service {
   async loadDriftHistory(): Promise<void> {
     try {
       const raw = await readFile(DRIFT_HISTORY_FILE, 'utf-8');
-      const parsed = JSON.parse(raw) as Record<string, DriftRecord[]>;
-      this.driftHistory = new Map(Object.entries(parsed));
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
 
-      // Restore auditHistory from the latest record so the re-auditor has context
+      for (const [wallet, value] of Object.entries(parsed)) {
+        // Migrate old format: array of DriftRecords → new structured format
+        if (Array.isArray(value)) {
+          // Old format: { "wallet": [DriftRecord, ...] }
+          const records = value as DriftRecord[];
+          this.driftHistory.set(wallet, records);
+          this.agentMeta.set(wallet, {
+            tier: 'WARM',
+            lastAuditedAt: records.length > 0 ? records[records.length - 1].timestamp : null,
+            nextDueAt: new Date().toISOString(), // audit promptly
+            consecutivePasses: 0,
+          });
+        } else if (value && typeof value === 'object' && 'driftRecords' in value) {
+          // New format: { "wallet": { driftRecords, tier, ... } }
+          const entry = value as { driftRecords: DriftRecord[]; tier: AgentTier; lastAuditedAt: string | null; nextDueAt: string; consecutivePasses: number };
+          this.driftHistory.set(wallet, entry.driftRecords);
+          this.agentMeta.set(wallet, {
+            tier: entry.tier,
+            lastAuditedAt: entry.lastAuditedAt,
+            nextDueAt: entry.nextDueAt,
+            consecutivePasses: entry.consecutivePasses,
+          });
+        }
+      }
+
+      // Restore auditHistory and driftSeverityCache from latest records
       for (const [wallet, records] of this.driftHistory) {
         if (records.length > 0) {
           const latest = records[records.length - 1];
@@ -740,8 +764,9 @@ export class SaidSentinelService extends Service {
           this.driftSeverityCache.set(wallet, analysis.severity);
         }
       }
+
       logger.info(
-        { wallets: this.driftHistory.size },
+        { wallets: this.driftHistory.size, migrated: [...this.agentMeta.values()].filter(m => m.tier === 'WARM' && m.consecutivePasses === 0).length },
         'Drift history loaded from disk'
       );
     } catch {
@@ -752,7 +777,11 @@ export class SaidSentinelService extends Service {
   async saveDriftHistory(): Promise<void> {
     try {
       await mkdir('/app/data', { recursive: true });
-      const obj = Object.fromEntries(this.driftHistory);
+      const obj: Record<string, { driftRecords: DriftRecord[]; tier: AgentTier; lastAuditedAt: string | null; nextDueAt: string; consecutivePasses: number }> = {};
+      for (const [wallet, records] of this.driftHistory) {
+        const meta = this.agentMeta.get(wallet) ?? { tier: 'WARM' as AgentTier, lastAuditedAt: null, nextDueAt: new Date().toISOString(), consecutivePasses: 0 };
+        obj[wallet] = { driftRecords: records, ...meta };
+      }
       await writeFile(DRIFT_HISTORY_FILE, JSON.stringify(obj));
     } catch (err) {
       logger.warn({ err }, 'Failed to save drift history');
