@@ -673,14 +673,15 @@ export class SaidSentinelService extends Service {
   watcherTimer: ReturnType<typeof setInterval> | null = null;
   watcherStartedAt: Date | null = null;
 
-  // Re-Auditor state
+  // Re-Auditor state (tiered priority queue)
   auditHistory: Map<string, AuditSnapshot> = new Map();
+  agentMeta: Map<string, AgentMeta> = new Map();
   reauditorTimer: ReturnType<typeof setInterval> | null = null;
   reauditorRunning = false;
   reauditorLastRun: Date | null = null;
-  reauditorNextRun: Date | null = null;
   reauditorLastCycleStats: { audited: number; alerts: number } | null = null;
-  reauditorOffset = 0; // rotating cursor — advances each cycle so all agents are covered
+  reauditorTotalAuditsToday = 0;
+  reauditorDayStart: Date = new Date();
 
   // Reputation Drift Monitor state
   driftHistory: Map<string, DriftRecord[]> = new Map();
