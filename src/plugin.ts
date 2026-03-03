@@ -1500,7 +1500,7 @@ export class SaidSentinelService extends Service {
       `${newAgents24h} new agents in the last 24h`,
       `${this.reauditorTotalAuditsToday} audits today`,
       ``,
-      `Dashboard: /dashboard`,
+      `Dashboard: https://said-sentinel.fly.dev/dashboard`,
     ];
     void postToX(pulseLines.join("\n"));
 
@@ -1798,28 +1798,8 @@ export class SaidSentinelService extends Service {
       }
     }
 
-    // Post to X on initial watcher audits (once per agent, fire-and-forget)
-    if (source === "watcher") {
-      const meta = this.ensureAgentMeta(agent.owner);
-      if (!meta.tweetedAt && agent.card?.twitter) {
-        const conf = `${(confidenceScore * 100).toFixed(0)}%`;
-        let tweetText: string;
-        if (verdict === "PASS") {
-          const badges = [agent.isVerified ? "✓ Verified" : null, "✓ Metadata"]
-            .filter(Boolean)
-            .join(" | ");
-          tweetText = `@${agent.card.twitter} Audited on @saidinfra\n\nVerdict: PASS (${conf})\n${badges}\n\nFull report: ${reportUrl}\n\nRequest a re-audit anytime to refresh your score.`;
-        } else {
-          const topFindings = findings
-            .slice(0, 2)
-            .map((f) => f.issue)
-            .join("; ");
-          tweetText = `@${agent.card.twitter} Audited on @saidinfra\n\nVerdict: ${verdict} (${conf})\n${topFindings}\n\nFull report: ${reportUrl}\n\nFix the issues and request a re-audit to improve your score.`;
-        }
-        void postToX(tweetText);
-        meta.tweetedAt = new Date().toISOString();
-      }
-    }
+    // X posting is reserved for the daily ecosystem pulse only (see sendDailyDigest).
+    // Individual agent audit mentions are Telegram-only to avoid noise on X.
 
     // Update audit history, drift records, and tier metadata
     const snapshot: AuditSnapshot = {
