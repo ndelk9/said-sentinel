@@ -834,20 +834,22 @@ export class SaidSentinelService extends Service {
     }
   }
 
-  // ─── Continuous Re-Auditor ─────────────────────────────────────────────────
+  // ─── Tiered Re-Auditor ──────────────────────────────────────────────────────
   startReauditor(): void {
-    this.reauditorNextRun = new Date(Date.now() + REAUDIT_INTERVAL_MS);
     this.reauditorTimer = setInterval(() => {
-      void this.runReauditCycle();
-    }, REAUDIT_INTERVAL_MS);
+      void this.runMicroCycle();
+    }, REAUDIT_CYCLE_INTERVAL_MS);
+
     logger.info(
       {
-        intervalHours: (REAUDIT_INTERVAL_MS / 3600000).toFixed(1),
-        batchSize: REAUDIT_BATCH_SIZE,
-        delayMs: REAUDIT_DELAY_MS,
-        firstRunAt: this.reauditorNextRun.toUTCString(),
+        cycleIntervalMin: (REAUDIT_CYCLE_INTERVAL_MS / 60000).toFixed(1),
+        agentsPerCycle: REAUDIT_AGENTS_PER_CYCLE,
+        delayMs: REAUDIT_AGENT_DELAY_MS,
+        tierHotH: (REAUDIT_TIER_HOT_MS / 3600000).toFixed(1),
+        tierWarmH: (REAUDIT_TIER_WARM_MS / 3600000).toFixed(1),
+        tierCoolH: (REAUDIT_TIER_COOL_MS / 3600000).toFixed(1),
       },
-      'Continuous Re-Auditor: scheduled'
+      'Tiered Re-Auditor: started'
     );
   }
 
@@ -855,8 +857,47 @@ export class SaidSentinelService extends Service {
     if (this.reauditorTimer) {
       clearInterval(this.reauditorTimer);
       this.reauditorTimer = null;
-      logger.info('Continuous Re-Auditor: stopped');
+      logger.info('Tiered Re-Auditor: stopped');
     }
+  }
+
+  ensureAgentMeta(wallet: string): AgentMeta {
+    let meta = this.agentMeta.get(wallet);
+    if (!meta) {
+      meta = {
+        tier: 'WARM',
+        lastAuditedAt: null,
+        nextDueAt: new Date().toISOString(), // due immediately
+        consecutivePasses: 0,
+      };
+      this.agentMeta.set(wallet, meta);
+    }
+    return meta;
+  }
+
+  selectNextBatch(limit: number): string[] {
+    const now = Date.now();
+
+    // Build urgency-scored list from all known agents
+    const scored: { wallet: string; urgency: number; tierRank: number }[] = [];
+    for (const wallet of this.knownAgentWallets) {
+      const meta = this.ensureAgentMeta(wallet);
+      const dueAt = new Date(meta.nextDueAt).getTime();
+      const urgency = now - dueAt; // positive = overdue
+      scored.push({ wallet, urgency, tierRank: TIER_RANK[meta.tier] });
+    }
+
+    // Sort: most overdue first, then by tier rank (HOT > WARM > COOL)
+    scored.sort((a, b) => {
+      if (b.urgency !== a.urgency) return b.urgency - a.urgency;
+      return b.tierRank - a.tierRank;
+    });
+
+    // Only pick agents that are actually due (urgency > 0)
+    return scored
+      .filter((s) => s.urgency > 0)
+      .slice(0, limit)
+      .map((s) => s.wallet);
   }
 
   // ─── Daily Digest ──────────────────────────────────────────────────────────
@@ -955,44 +996,33 @@ export class SaidSentinelService extends Service {
     logger.info('Daily Digest: sent');
   }
 
-  async runReauditCycle(force = false): Promise<{ audited: number; alerts: number }> {
-    if (this.reauditorRunning && !force) {
-      logger.warn('Continuous Re-Auditor: previous cycle still running, skipping');
+  async runMicroCycle(): Promise<{ audited: number; alerts: number }> {
+    if (this.reauditorRunning) {
+      logger.debug('Tiered Re-Auditor: previous micro-cycle still running, skipping');
+      return { audited: 0, alerts: 0 };
+    }
+
+    // Reset daily counter at midnight
+    const today = new Date();
+    if (today.getUTCDate() !== this.reauditorDayStart.getUTCDate()) {
+      this.reauditorTotalAuditsToday = 0;
+      this.reauditorDayStart = today;
+    }
+
+    const batch = this.selectNextBatch(REAUDIT_AGENTS_PER_CYCLE);
+    if (batch.length === 0) {
+      logger.debug('Tiered Re-Auditor: no agents due, skipping cycle');
       return { audited: 0, alerts: 0 };
     }
 
     this.reauditorRunning = true;
     this.reauditorLastRun = new Date();
-    this.reauditorNextRun = new Date(Date.now() + REAUDIT_INTERVAL_MS);
-
-    const all = Array.from(this.knownAgentWallets);
-    const total = all.length;
-    let wallets: string[];
-
-    if (total <= REAUDIT_BATCH_SIZE) {
-      // Fewer agents than batch size — audit all of them
-      wallets = all;
-      this.reauditorOffset = 0;
-    } else {
-      // Rotate: take BATCH_SIZE starting from offset, wrapping around
-      const start = this.reauditorOffset % total;
-      const end = start + REAUDIT_BATCH_SIZE;
-      wallets = end <= total
-        ? all.slice(start, end)
-        : [...all.slice(start), ...all.slice(0, end - total)];
-      this.reauditorOffset = end % total;
-    }
-
-    logger.info(
-      { total, auditing: wallets.length, offset: this.reauditorOffset },
-      'Continuous Re-Auditor: cycle started'
-    );
 
     let audited = 0;
     let alerts = 0;
 
     try {
-      for (const wallet of wallets) {
+      for (const wallet of batch) {
         try {
           const { findings, confidenceScore } = await auditIdentityPDA(wallet, this.saidClient, this.connection);
           const verdict = deriveVerdict(findings, confidenceScore);
@@ -1019,15 +1049,11 @@ export class SaidSentinelService extends Service {
           if (severityRank(driftAnalysis.severity) > severityRank(prevSeverity)) {
             this.driftSeverityCache.set(wallet, driftAnalysis.severity);
             await broadcastToTelegram(formatDriftAlert(driftAnalysis));
-            logger.info(
-              { wallet, prevSeverity, newSeverity: driftAnalysis.severity },
-              'Drift Monitor: severity worsened, alert broadcast'
-            );
           } else {
             this.driftSeverityCache.set(wallet, driftAnalysis.severity);
           }
 
-          // Broadcast only on verdict changes or first-time alerts — never spam unchanged PASSes
+          // Broadcast only on verdict changes or first-time alerts
           if (verdictChanged || isFirstAuditAlert) {
             const payload: Omit<SaidAuditResult, 'attestation'> = {
               protocol: 'SAID_v1',
@@ -1043,34 +1069,39 @@ export class SaidSentinelService extends Service {
               ...payload,
               attestation: { auditor: this.keypair.publicKey.toString(), signature },
             };
-
             await broadcastToTelegram(formatReauditBroadcast(wallet, auditResult, prev));
             alerts++;
-
-            logger.info(
-              { wallet, prev: prev?.verdict ?? 'NEW', current: verdict },
-              'Continuous Re-Auditor: verdict change detected and broadcast'
-            );
           }
+
+          // Update tier metadata
+          const meta = this.ensureAgentMeta(wallet);
+          if (verdict === 'PASS') {
+            meta.consecutivePasses++;
+          } else {
+            meta.consecutivePasses = 0;
+          }
+          meta.tier = classifyTier(verdict, driftAnalysis.severity, meta.consecutivePasses);
+          meta.lastAuditedAt = snapshot.timestamp;
+          meta.nextDueAt = computeNextDueAt(meta.tier);
 
           audited++;
         } catch (err) {
-          logger.warn({ err, wallet }, 'Continuous Re-Auditor: audit failed for wallet, skipping');
+          logger.warn({ err, wallet }, 'Tiered Re-Auditor: audit failed for wallet, skipping');
         }
 
         // Rate limit: pause between each agent
-        await sleep(REAUDIT_DELAY_MS);
+        await sleep(REAUDIT_AGENT_DELAY_MS);
       }
     } finally {
       this.reauditorRunning = false;
       this.reauditorLastCycleStats = { audited, alerts };
-      // Persist drift history to disk after every cycle
+      this.reauditorTotalAuditsToday += audited;
       await this.saveDriftHistory();
     }
 
     logger.info(
-      { audited, alerts, skipped: wallets.length - audited },
-      'Continuous Re-Auditor: cycle complete'
+      { audited, alerts, totalToday: this.reauditorTotalAuditsToday },
+      'Tiered Re-Auditor: micro-cycle complete'
     );
 
     return { audited, alerts };
