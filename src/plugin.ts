@@ -1133,10 +1133,32 @@ export class SaidSentinelService extends Service {
       'New Agent Watcher: new agents detected!'
     );
 
+    // Process up to WATCHER_BATCH_CAP agents this poll
+    const batch = newAgents.slice(0, WATCHER_BATCH_CAP);
+    const overflow = newAgents.slice(WATCHER_BATCH_CAP);
+
+    // Register ALL new agents immediately (prevents re-detection next poll)
     for (const agent of newAgents) {
-      // Register immediately so concurrent polls don't re-audit the same agent
       this.knownAgentWallets.add(agent.owner);
+    }
+
+    // Overflow agents: register as WARM in priority queue (no immediate audit)
+    if (overflow.length > 0) {
+      for (const agent of overflow) {
+        this.ensureAgentMeta(agent.owner); // defaults to WARM, nextDueAt = now
+      }
+      logger.info(
+        { overflow: overflow.length },
+        'New Agent Watcher: excess agents queued for priority re-auditor'
+      );
+    }
+
+    // Audit the capped batch with delay between each
+    for (const agent of batch) {
       await this.auditAndBroadcast(agent);
+      if (batch.indexOf(agent) < batch.length - 1) {
+        await sleep(WATCHER_AGENT_DELAY_MS);
+      }
     }
   }
 
