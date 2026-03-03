@@ -1,21 +1,29 @@
-import { describe, expect, it, beforeEach, afterEach, mock, spyOn } from 'bun:test';
-import plugin from '../plugin';
-import { z } from 'zod';
-import { createMockRuntime } from './utils/core-test-utils';
-import { logger } from '@elizaos/core';
+import {
+  describe,
+  expect,
+  it,
+  beforeEach,
+  afterEach,
+  mock,
+  spyOn,
+} from "bun:test";
+import plugin from "../plugin";
+import { z } from "zod";
+import { createMockRuntime } from "./utils/core-test-utils";
+import { logger } from "@elizaos/core";
 
 // Access the plugin's init function
 const initPlugin = plugin.init;
 
-describe('Plugin Configuration Schema', () => {
+describe("Plugin Configuration Schema", () => {
   // Create a backup of the original env values
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
     // Use spyOn for logger methods
-    spyOn(logger, 'info');
-    spyOn(logger, 'error');
-    spyOn(logger, 'warn');
+    spyOn(logger, "info");
+    spyOn(logger, "error");
+    spyOn(logger, "warn");
     // Reset environment variables before each test
     process.env = { ...originalEnv };
   });
@@ -25,9 +33,9 @@ describe('Plugin Configuration Schema', () => {
     process.env = { ...originalEnv };
   });
 
-  it('should accept valid configuration', async () => {
+  it("should accept valid configuration", async () => {
     const validConfig = {
-      EXAMPLE_PLUGIN_VARIABLE: 'valid-value',
+      EXAMPLE_PLUGIN_VARIABLE: "valid-value",
     };
 
     if (initPlugin) {
@@ -41,7 +49,7 @@ describe('Plugin Configuration Schema', () => {
     }
   });
 
-  it('should accept empty configuration', async () => {
+  it("should accept empty configuration", async () => {
     const emptyConfig = {};
 
     if (initPlugin) {
@@ -55,10 +63,10 @@ describe('Plugin Configuration Schema', () => {
     }
   });
 
-  it('should accept configuration with additional properties', async () => {
+  it("should accept configuration with additional properties", async () => {
     const configWithExtra = {
-      EXAMPLE_PLUGIN_VARIABLE: 'valid-value',
-      EXTRA_PROPERTY: 'should be ignored',
+      EXAMPLE_PLUGIN_VARIABLE: "valid-value",
+      EXTRA_PROPERTY: "should be ignored",
     };
 
     if (initPlugin) {
@@ -72,9 +80,9 @@ describe('Plugin Configuration Schema', () => {
     }
   });
 
-  it('should reject invalid configuration', async () => {
+  it("should reject invalid configuration", async () => {
     const invalidConfig = {
-      EXAMPLE_PLUGIN_VARIABLE: '', // Empty string violates min length
+      EXAMPLE_PLUGIN_VARIABLE: "", // Empty string violates min length
     };
 
     if (initPlugin) {
@@ -88,9 +96,9 @@ describe('Plugin Configuration Schema', () => {
     }
   });
 
-  it('should set environment variables from valid config', async () => {
+  it("should set environment variables from valid config", async () => {
     const testConfig = {
-      EXAMPLE_PLUGIN_VARIABLE: 'test-value',
+      EXAMPLE_PLUGIN_VARIABLE: "test-value",
     };
 
     if (initPlugin) {
@@ -101,13 +109,13 @@ describe('Plugin Configuration Schema', () => {
       await initPlugin(testConfig, createMockRuntime());
 
       // Verify environment variable was set
-      expect(process.env.EXAMPLE_PLUGIN_VARIABLE).toBe('test-value');
+      expect(process.env.EXAMPLE_PLUGIN_VARIABLE).toBe("test-value");
     }
   });
 
-  it('should not override existing environment variables', async () => {
+  it("should not override existing environment variables", async () => {
     // Set environment variable before initialization
-    process.env.EXAMPLE_PLUGIN_VARIABLE = 'pre-existing-value';
+    process.env.EXAMPLE_PLUGIN_VARIABLE = "pre-existing-value";
 
     const testConfig = {
       // Omit the variable to test that existing env vars aren't overridden
@@ -117,20 +125,20 @@ describe('Plugin Configuration Schema', () => {
       await initPlugin(testConfig, createMockRuntime());
 
       // Verify environment variable was not changed
-      expect(process.env.EXAMPLE_PLUGIN_VARIABLE).toBe('pre-existing-value');
+      expect(process.env.EXAMPLE_PLUGIN_VARIABLE).toBe("pre-existing-value");
     }
   });
 
-  it('should handle zod validation errors gracefully', async () => {
+  it("should handle zod validation errors gracefully", async () => {
     // Create a mock of zod's parseAsync that throws a ZodError
     const mockZodError = new z.ZodError([
       {
         code: z.ZodIssueCode.too_small,
         minimum: 1,
-        type: 'string',
+        type: "string",
         inclusive: true,
-        message: 'Example plugin variable is too short',
-        path: ['EXAMPLE_PLUGIN_VARIABLE'],
+        message: "Example plugin variable is too short",
+        path: ["EXAMPLE_PLUGIN_VARIABLE"],
       },
     ]);
 
@@ -156,9 +164,9 @@ describe('Plugin Configuration Schema', () => {
     schema.parseAsync = originalParseAsync;
   });
 
-  it('should rethrow non-zod errors', async () => {
+  it("should rethrow non-zod errors", async () => {
     // Create a generic error
-    const genericError = new Error('Something went wrong');
+    const genericError = new Error("Something went wrong");
 
     // Create a simple schema for mocking
     const schema = z.object({

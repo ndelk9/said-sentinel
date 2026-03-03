@@ -49,7 +49,7 @@ E2E tests are integrated directly into your project through the main index.ts fi
 
 ```typescript
 // src/index.ts
-import { ProjectStarterTestSuite } from './__tests__/e2e/project-starter.e2e';
+import { ProjectStarterTestSuite } from "./__tests__/e2e/project-starter.e2e";
 
 export const project: Project = {
   agents: [projectAgent],
