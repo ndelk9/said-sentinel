@@ -45,10 +45,6 @@ for (const v of ['REAUDIT_INTERVAL_MS', 'REAUDIT_BATCH_SIZE', 'REAUDIT_DELAY_MS'
   if (process.env[v]) logger.warn(`Env var ${v} is deprecated and ignored. See docs/plans/2026-03-02-reauditor-scaling-design.md for new config.`);
 }
 
-// ── Backward-compatible aliases (removed in later tasks) ─────────────────────
-const REAUDIT_INTERVAL_MS = REAUDIT_CYCLE_INTERVAL_MS;
-const REAUDIT_BATCH_SIZE = REAUDIT_AGENTS_PER_CYCLE;
-const REAUDIT_DELAY_MS = REAUDIT_AGENT_DELAY_MS;
 
 // ─── Config Schema ────────────────────────────────────────────────────────────
 const configSchema = z.object({
@@ -1501,6 +1497,9 @@ const watcherStatusAction: Action = {
     const watcherRunning = svc.watcherTimer !== null;
     const reauditorRunning = svc.reauditorTimer !== null;
 
+    const tierCounts = { HOT: 0, WARM: 0, COOL: 0 };
+    for (const meta of svc.agentMeta.values()) tierCounts[meta.tier]++;
+
     const lines = [
       `**Said Sentinel — Monitoring Status**`,
       ``,
@@ -1510,13 +1509,14 @@ const watcherStatusAction: Action = {
       `Poll interval: every ${WATCHER_POLL_MS / 60000} min`,
       `Agents tracked: ${svc.knownAgentWallets.size}`,
       ``,
-      `**Continuous Re-Auditor**`,
-      `${reauditorRunning ? '🟢' : '🔴'} ${reauditorRunning ? 'Scheduled' : 'Stopped'}${svc.reauditorRunning ? ' *(cycle in progress)*' : ''}`,
-      `Interval: every ${(REAUDIT_INTERVAL_MS / 3600000).toFixed(1)}h | Batch: ${REAUDIT_BATCH_SIZE} agents | Delay: ${REAUDIT_DELAY_MS}ms`,
-      `Last run: ${svc.reauditorLastRun?.toUTCString() ?? 'Not yet run'}`,
-      `Next run: ${svc.reauditorNextRun?.toUTCString() ?? 'N/A'}`,
+      `**Tiered Re-Auditor**`,
+      `${reauditorRunning ? '🟢' : '🔴'} ${reauditorRunning ? 'Running' : 'Stopped'}${svc.reauditorRunning ? ' *(micro-cycle in progress)*' : ''}`,
+      `Cycle: every ${(REAUDIT_CYCLE_INTERVAL_MS / 60000).toFixed(0)}min | ${REAUDIT_AGENTS_PER_CYCLE} agents/cycle | ${REAUDIT_AGENT_DELAY_MS / 1000}s delay`,
+      `Tiers: HOT=${(REAUDIT_TIER_HOT_MS / 3600000).toFixed(0)}h / WARM=${(REAUDIT_TIER_WARM_MS / 3600000).toFixed(0)}h / COOL=${(REAUDIT_TIER_COOL_MS / 3600000).toFixed(0)}h`,
+      `Last micro-cycle: ${svc.reauditorLastRun?.toUTCString() ?? 'Not yet run'}`,
       `Last cycle: ${svc.reauditorLastCycleStats ? `${svc.reauditorLastCycleStats.audited} audited, ${svc.reauditorLastCycleStats.alerts} alerts` : 'N/A'}`,
-      `Coverage: ${svc.auditHistory.size}/${svc.knownAgentWallets.size} agents audited | next offset: ${svc.reauditorOffset}`,
+      `Tier distribution: HOT=${tierCounts.HOT} / WARM=${tierCounts.WARM} / COOL=${tierCounts.COOL}`,
+      `Coverage: ${svc.auditHistory.size}/${svc.knownAgentWallets.size} agents audited | ${svc.reauditorTotalAuditsToday} audits today`,
       ``,
       `**Broadcast**`,
       `${channelConfigured ? '✅ Telegram channel configured' : '⚠️ TELEGRAM_AUDIT_CHANNEL_ID not set'}`,
@@ -1580,14 +1580,14 @@ const reauditNowAction: Action = {
       return { success: false, text: 'Cycle already running' };
     }
 
-    const total = Math.min(svc.knownAgentWallets.size, REAUDIT_BATCH_SIZE);
+    const total = Math.min(svc.knownAgentWallets.size, REAUDIT_AGENTS_PER_CYCLE);
     await callback({
-      text: `Starting re-audit cycle for up to **${total}** agents (${REAUDIT_DELAY_MS}ms between each). I'll report when done.`,
+      text: `Starting micro-cycle for up to **${total}** agents (${REAUDIT_AGENT_DELAY_MS / 1000}s between each). I'll report when done.`,
       actions: ['REAUDIT_NOW'],
     });
 
     // Run in background — don't await in handler
-    void svc.runReauditCycle(true).then(({ audited, alerts }) => {
+    void svc.runMicroCycle().then(({ audited, alerts }) => {
       logger.info({ audited, alerts }, 'REAUDIT_NOW: manual cycle complete');
     });
 
@@ -1854,8 +1854,15 @@ const saidPlugin: Plugin = {
             running: svc.reauditorTimer !== null,
             cycleInProgress: svc.reauditorRunning,
             lastRun: svc.reauditorLastRun?.toISOString() ?? null,
-            nextRun: svc.reauditorNextRun?.toISOString() ?? null,
             lastCycleStats: svc.reauditorLastCycleStats,
+            auditsToday: svc.reauditorTotalAuditsToday,
+            cycleIntervalMs: REAUDIT_CYCLE_INTERVAL_MS,
+            agentsPerCycle: REAUDIT_AGENTS_PER_CYCLE,
+            tierDistribution: (() => {
+              const counts = { HOT: 0, WARM: 0, COOL: 0 };
+              for (const meta of svc.agentMeta.values()) counts[meta.tier]++;
+              return counts;
+            })(),
             coverage: {
               audited: svc.auditHistory.size,
               total: svc.knownAgentWallets.size,
@@ -2011,10 +2018,13 @@ async function refresh(){
     document.getElementById('reauditor-dot').className='w-2 h-2 rounded-full '+(d.reauditor.running?'bg-emerald-500':'bg-red-500');
     document.getElementById('reauditor-details').innerHTML=lines([
       d.reauditor.running
-        ?'<span class="text-emerald-400">Scheduled</span>'+(d.reauditor.cycleInProgress?' <span class="text-yellow-400">(running)</span>':'')
+        ?'<span class="text-emerald-400">Running</span>'+(d.reauditor.cycleInProgress?' <span class="text-yellow-400">(micro-cycle)</span>':'')
         :'<span class="text-red-400">Stopped</span>',
       'Last run: '+ago(d.reauditor.lastRun),
-      'Next run: '+ago(d.reauditor.nextRun),
+      'Re-auditor: '+(d.reauditor.running?'running':'stopped')+
+      ' | '+d.reauditor.agentsPerCycle+'/cycle every '+Math.round(d.reauditor.cycleIntervalMs/60000)+'min'+
+      ' | '+d.reauditor.auditsToday+' audits today'+
+      ' | HOT:'+d.reauditor.tierDistribution.HOT+' WARM:'+d.reauditor.tierDistribution.WARM+' COOL:'+d.reauditor.tierDistribution.COOL,
       d.reauditor.lastCycleStats?'Last cycle: '+d.reauditor.lastCycleStats.audited+' audited, '+d.reauditor.lastCycleStats.alerts+' alerts':null,
       'Coverage: '+cov.audited+'/'+cov.total+' ('+pct+'%)',
     ]);
