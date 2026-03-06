@@ -371,32 +371,6 @@ function severityRank(s: DriftSeverity): number {
   return { NONE: 0, MILD: 1, MODERATE: 2, SEVERE: 3 }[s];
 }
 
-function formatDriftAlert(analysis: DriftAnalysis): string {
-  const icons: Record<DriftSeverity, string> = {
-    NONE: "✅",
-    MILD: "🟡",
-    MODERATE: "🟠",
-    SEVERE: "🔴",
-  };
-  const icon = icons[analysis.severity];
-
-  const lines = [
-    `${icon} *Reputation Drift Detected*`,
-    ``,
-    `Wallet: \`${analysis.wallet}\``,
-    `Severity: *${analysis.severity}*`,
-    `Latest Verdict: ${analysis.latestVerdict}`,
-    `Consecutive Alerts: ${analysis.consecutiveAlerts}`,
-    `Score: ${(analysis.baselineScore * 100).toFixed(0)}% → ${(analysis.latestScore * 100).toFixed(0)}% (${analysis.scoreDrop > 0 ? "-" : "+"}${(Math.abs(analysis.scoreDrop) * 100).toFixed(0)}%)`,
-    `Trend (last 5): ${analysis.scoreTrend < 0 ? "📉" : "📈"} ${(analysis.scoreTrend * 100).toFixed(1)}%/audit`,
-    `Records: ${analysis.recordCount} audits tracked`,
-    ``,
-    `_Said Sentinel Drift Monitor • ${new Date().toUTCString()}_`,
-  ];
-
-  return lines.join("\n");
-}
-
 // ─── Telegram Broadcast ───────────────────────────────────────────────────────
 async function broadcastToTelegram(text: string): Promise<void> {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_AUDIT_CHANNEL) {
@@ -539,58 +513,6 @@ function formatAuditBroadcast(
 
   lines.push(``);
   lines.push(`_Said Sentinel • ${new Date(audit.timestamp).toUTCString()}_`);
-
-  return lines.join("\n");
-}
-
-function formatReauditBroadcast(
-  wallet: string,
-  audit: SaidAuditResult,
-  prev: AuditSnapshot | null,
-): string {
-  const verdictEmoji =
-    audit.verdict === "PASS" ? "✅" : audit.verdict === "FAIL" ? "❌" : "⚠️";
-
-  let headerEmoji = "🔄";
-  if (prev) {
-    if (audit.verdict === "FAIL" && prev.verdict !== "FAIL") headerEmoji = "🚨";
-    else if (audit.verdict === "PASS" && prev.verdict !== "PASS")
-      headerEmoji = "📈";
-    else if (audit.verdict === "WARNING" && prev.verdict === "PASS")
-      headerEmoji = "📉";
-  }
-
-  const lines: string[] = [
-    `${headerEmoji} *Re-Audit Alert*`,
-    ``,
-    `Wallet: \`${wallet}\``,
-    `${verdictEmoji} *${audit.verdict}* (${(audit.confidenceScore * 100).toFixed(0)}% confidence)`,
-  ];
-
-  if (prev) {
-    lines.push(`Change: *${prev.verdict} → ${audit.verdict}*`);
-    const scoreDelta = (audit.confidenceScore - prev.confidenceScore) * 100;
-    if (Math.abs(scoreDelta) >= 5) {
-      lines.push(
-        `Score drift: ${scoreDelta > 0 ? "+" : ""}${scoreDelta.toFixed(0)}%`,
-      );
-    }
-  }
-
-  if (audit.findings.length > 0) {
-    lines.push(``);
-    lines.push(`*Findings:*`);
-    for (const f of audit.findings) {
-      const icon =
-        f.severity === "HIGH" ? "🔴" : f.severity === "MEDIUM" ? "🟡" : "🟢";
-      lines.push(`${icon} ${f.issue}`);
-    }
-  }
-
-  lines.push(``);
-  lines.push(
-    `_Said Sentinel Re-Auditor • ${new Date(audit.timestamp).toUTCString()}_`,
-  );
 
   return lines.join("\n");
 }
@@ -1301,7 +1223,6 @@ export class SaidSentinelService extends Service {
     const name = this.agentNames.get(wallet) ?? `${wallet.slice(0, 8)}...`;
     const driftSeverity = this.driftSeverityCache.get(wallet) ?? "NONE";
 
-    // TODO(human): implement extractComplianceFromFindings
     const compliance = extractComplianceFromFindings(findings);
 
     const report: Record<string, unknown> = {
@@ -1492,7 +1413,7 @@ export class SaidSentinelService extends Service {
       return Date.now() - new Date(m.lastAuditedAt).getTime() < 86400000;
     }).length;
     const pulseLines = [
-      `@saidinfra Protocol Pulse`,
+      `Protocol Pulse @saidinfra`,
       ``,
       `${total} agents registered`,
       `${tierCounts.COOL} Trusted | ${tierCounts.WARM} Needs Attention | ${tierCounts.HOT} At Risk`,
@@ -1562,41 +1483,12 @@ export class SaidSentinelService extends Service {
 
           // Append to persistent drift history and compute analysis
           const driftAnalysis = this.appendDriftRecord(wallet, snapshot);
-          const prevSeverity = this.driftSeverityCache.get(wallet) ?? "NONE";
 
-          // Broadcast drift alert if severity worsened to MODERATE+
-          if (
-            severityRank(driftAnalysis.severity) > severityRank(prevSeverity) &&
-            severityRank(driftAnalysis.severity) >= severityRank("MODERATE")
-          ) {
-            this.driftSeverityCache.set(wallet, driftAnalysis.severity);
-            await broadcastToTelegram(formatDriftAlert(driftAnalysis));
-          } else {
-            this.driftSeverityCache.set(wallet, driftAnalysis.severity);
-          }
+          // Update cached drift severity (no longer broadcast — daily digest only)
+          this.driftSeverityCache.set(wallet, driftAnalysis.severity);
 
-          // Broadcast only on verdict changes or first-time alerts
+          // Track verdict changes for daily digest stats (no longer broadcast individually)
           if (verdictChanged || isFirstAuditAlert) {
-            const payload: Omit<SaidAuditResult, "attestation"> = {
-              protocol: "SAID_v1",
-              auditId: crypto.randomUUID(),
-              timestamp: new Date().toISOString(),
-              target: wallet,
-              verdict,
-              confidenceScore: Math.round(confidenceScore * 100) / 100,
-              findings,
-            };
-            const signature = signPayload(payload, this.keypair);
-            const auditResult: SaidAuditResult = {
-              ...payload,
-              attestation: {
-                auditor: this.keypair.publicKey.toString(),
-                signature,
-              },
-            };
-            await broadcastToTelegram(
-              formatReauditBroadcast(wallet, auditResult, prev),
-            );
             alerts++;
           }
 
@@ -1766,10 +1658,13 @@ export class SaidSentinelService extends Service {
 
     const reportUrl = `/api/sentinel/agent/${agent.owner}`;
 
-    // Telegram broadcast with report URL
-    const broadcastMessage =
-      formatAuditBroadcast(agent, auditResult) + `\n\n📊 Report: ${reportUrl}`;
-    await broadcastToTelegram(broadcastMessage);
+    // Telegram broadcast only for requested re-audits (watcher audits are silent)
+    if (source === "requested") {
+      const broadcastMessage =
+        formatAuditBroadcast(agent, auditResult) +
+        `\n\n📊 Report: ${reportUrl}`;
+      await broadcastToTelegram(broadcastMessage);
+    }
 
     // Submit feedback only for watcher + requested sources (skip self, 24h cooldown)
     const selfPubkey = this.keypair.publicKey.toString();
